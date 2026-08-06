@@ -327,7 +327,11 @@ fn extract_positioned_text_with_folio_context_impl(
         None,
         CoordinateFrame::UserSpace,
     )?;
-    if !layout::needs_document_page_number_context(&selected_items, doc.get_pages().len()) {
+    if !layout::needs_document_page_number_context(
+        &selected_items,
+        doc.get_pages().len(),
+        &page_vertical_bounds(doc),
+    ) {
         return Ok((
             (selected_items, selected_rects, selected_lines),
             page_thresholds,
@@ -1319,6 +1323,22 @@ pub(crate) fn get_number(obj: &Object) -> Option<f32> {
         Object::Real(r) => Some(*r),
         _ => None,
     }
+}
+
+/// Vertical extent (y0, y1) of each page's visible box, for measuring the
+/// page-number bands from the page's real top edge. The box is the same one
+/// [`visible_page_box`] resolves for the positioned-item frame — `CropBox ∩
+/// MediaBox` with page-tree inheritance — but the values stay in raw PDF user
+/// space, because the markdown pipeline the bands serve never leaves it.
+/// Pages without a resolvable box are absent, which keeps the calibrated
+/// absolute bands for them.
+pub(crate) fn page_vertical_bounds(doc: &Document) -> HashMap<u32, (f32, f32)> {
+    doc.get_pages()
+        .into_iter()
+        .filter_map(|(page_num, page_id)| {
+            visible_page_box(doc, page_id).map(|page_box| (page_num, (page_box.y0, page_box.y1)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
