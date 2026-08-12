@@ -531,11 +531,12 @@ fn extract_pages_markdown_mem_impl(
     // Resolve page numbers with full-document context before partitioning.
     // Per-page Markdown receives the original items plus these decisions so
     // table detection can retain legitimate numeric cells.
+    let page_bounds = extractor::page_vertical_bounds(&doc);
     let (filtered_items, removed_page_number_pages, page_number_removal_mask) =
         extractor::filter_markdown_page_numbers_with_removed_pages(
             all_items.clone(),
             page_count,
-            &extractor::page_vertical_bounds(&doc),
+            &page_bounds,
         );
 
     // Tables need the original numeric cells; columns use folio-cleaned
@@ -552,7 +553,13 @@ fn extract_pages_markdown_mem_impl(
     // Compute font stats from full document (cross-page consistency).
     let font_stats = markdown::analysis::calculate_font_stats_from_items(&filtered_items);
     let repeated_header_footer_items = if strip_repeated_headers_footers {
-        repeated_header_footer_item_keys(&all_items, &page_thresholds, &chart_regions, page_count)
+        repeated_header_footer_item_keys(
+            &all_items,
+            &page_thresholds,
+            &chart_regions,
+            page_count,
+            &page_bounds,
+        )
     } else {
         HashSet::new()
     };
@@ -669,6 +676,7 @@ fn extract_pages_markdown_mem_impl(
                     prefiltered_page_number_pages: Some(&removed_page_number_pages),
                     prefiltered_page_number_mask: Some(&page_number_removal_mask),
                     precomputed_chart_regions: Some(&chart_regions),
+                    page_bounds: &page_bounds,
                 },
             )
         };
@@ -790,6 +798,7 @@ fn repeated_header_footer_item_keys(
     page_thresholds: &HashMap<u32, f32>,
     chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
     page_count: u32,
+    page_bounds: &extractor::PageVerticalBounds,
 ) -> HashSet<HeaderFooterItemKey> {
     let candidates = items
         .iter()
@@ -806,6 +815,7 @@ fn repeated_header_footer_item_keys(
         page_thresholds,
         &HashSet::new(),
         chart_regions,
+        page_bounds,
     );
     let all_items: HashSet<_> = lines
         .iter()
@@ -860,7 +870,13 @@ mod ocr_header_footer_tests {
             thresholds.insert(page, 0.1);
         }
 
-        let removed = repeated_header_footer_item_keys(&items, &thresholds, &HashMap::new(), 3);
+        let removed = repeated_header_footer_item_keys(
+            &items,
+            &thresholds,
+            &HashMap::new(),
+            3,
+            &HashMap::new(),
+        );
         assert_eq!(removed.len(), 2);
         for page in 1..=3 {
             assert_eq!(
@@ -1269,6 +1285,7 @@ pub fn extract_tables_in_regions_mem(
 
     let needed_pages: HashSet<u32> = page_regions.iter().map(|(p, _)| p + 1).collect();
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
+    let page_bounds = extractor::page_vertical_bounds(&doc);
 
     let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
     let mut rects_by_page: HashMap<u32, Vec<PdfRect>> = HashMap::new();
@@ -1531,7 +1548,9 @@ pub fn extract_tables_in_regions_mem(
             {
                 candidates.push(candidate);
             }
-            if let Some(table) = tables::try_build_table_from_columns(&matched, page_1idx) {
+            if let Some(table) =
+                tables::try_build_table_from_columns(&matched, page_1idx, &page_bounds)
+            {
                 if let Some(candidate) = evaluate(TableCandidateSource::Column, &table) {
                     candidates.push(candidate);
                 }
@@ -4375,6 +4394,10 @@ fn process_document(
                     .as_ref()
                     .is_none_or(|filter| filter.contains(&page))
             };
+            // Measured once and shared: the folio filter, column detection and
+            // the column table builder must all read the same page geometry or
+            // they disagree about where a page's margin is.
+            let page_bounds = extractor::page_vertical_bounds(&doc);
             let rects: Vec<_> = rects
                 .into_iter()
                 .filter(|rect| selected_page(rect.page))
@@ -4396,7 +4419,7 @@ fn process_document(
                 items,
                 page_count,
                 options.page_filter.as_ref(),
-                &extractor::page_vertical_bounds(&doc),
+                &page_bounds,
             );
 
             let text_quality = analyze_text_quality(&items);
@@ -4425,6 +4448,7 @@ fn process_document(
                         page_count,
                         prefiltered_page_number_pages: Some(&removed_pages),
                         prefiltered_page_number_mask: Some(removal_mask.as_slice()),
+                        page_bounds: &page_bounds,
                         precomputed_chart_regions: Some(&chart_regions),
                     },
                 ))
@@ -6202,7 +6226,7 @@ fn select_items_with_document_folio_context(
     all_items: Vec<types::TextItem>,
     page_count: u32,
     page_filter: Option<&HashSet<u32>>,
-    page_bounds: &std::collections::HashMap<u32, (f32, f32)>,
+    page_bounds: &extractor::PageVerticalBounds,
 ) -> FolioFilteredItems {
     let (all_layout_items, all_removed_pages, all_removal_mask) =
         extractor::filter_markdown_page_numbers_with_removed_pages(
@@ -6616,7 +6640,7 @@ mod tests {
         let (filtered, _, _) = extractor::filter_markdown_page_numbers_with_removed_pages(
             items.clone(),
             1,
-            &std::collections::HashMap::new(),
+            &HashMap::new(),
         );
         assert!(filtered.is_empty());
 
@@ -6712,7 +6736,7 @@ mod tests {
         let (page_local_layout, _, _) = extractor::filter_markdown_page_numbers_with_removed_pages(
             page_one_items.clone(),
             4,
-            &std::collections::HashMap::new(),
+            &HashMap::new(),
         );
         let page_local = compute_layout_complexity(&page_one_items, &page_local_layout, &[], &[]);
         assert!(
@@ -6724,7 +6748,7 @@ mod tests {
             items,
             4,
             Some(&HashSet::from([1])),
-            &std::collections::HashMap::new(),
+            &HashMap::new(),
         );
         assert_eq!(
             selected

@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::PageVerticalBounds;
 use crate::text_utils::{effective_width, sort_line_items};
 use crate::types::{TextItem, TextLine};
 use log::debug;
@@ -1124,27 +1125,60 @@ const PAGE_NUMBER_Y_TOLERANCE: f32 = 3.0;
 const PAGE_NUMBER_CONTEXT_GAP_EM: f32 = 1.5;
 const PAGE_NUMBER_BOTTOM_Y: f32 = 100.0;
 const PAGE_NUMBER_TOP_Y: f32 = 720.0;
-/// The page height the absolute band constants above were calibrated for
-/// (US Letter). Pages whose visible box differs scale the bands by their
-/// real height, so an A4 page (841.89pt) does not treat the top ~122pt —
-/// eight lines of body text — as the folio zone (issue #283).
+/// The page height `PAGE_NUMBER_TOP_Y` was calibrated for (US Letter), and
+/// the margin it therefore describes: one inch below the top edge. On a page
+/// of a different height the margin is the meaning and 720 is only its value
+/// on this one trim.
 const PAGE_NUMBER_BAND_REFERENCE_HEIGHT: f32 = 792.0;
+const PAGE_NUMBER_TOP_MARGIN: f32 = PAGE_NUMBER_BAND_REFERENCE_HEIGHT - PAGE_NUMBER_TOP_Y;
+/// Below one inch a page box is not a page but a damaged or degenerate entry,
+/// and a band derived from it could land anywhere. `extract_positioned_text`
+/// applies a floor of the same size before it trusts a box enough to clip
+/// against it, though on both dimensions and inclusively.
+const MIN_USABLE_PAGE_HEIGHT: f32 = 72.0;
 
-/// Vertical folio bands for a page: y above `top` or below `bottom` counts
-/// as page-edge. Derived from the page's visible box when known, keeping
-/// the exact historical thresholds on US-Letter-sized pages; without
-/// geometry the absolute constants apply unchanged.
+/// Vertical folio bands for a page: y above `top` or below `bottom` counts as
+/// page-edge.
+///
+/// Only the top band knows about the page. `PAGE_NUMBER_TOP_Y` was never a
+/// threshold, it was "one inch below the top edge" written down as the value
+/// it happens to take on US Letter, and on A4 that same number is 122pt down
+/// the page — eight lines of body text, deleted (issue #283). Measuring the
+/// margin from the page's real top edge restores what it meant.
+///
+/// It is measured, never scaled, and never allowed below its calibrated
+/// value:
+///
+/// - A4 (841.89) gives 769.89. That is the fix.
+/// - A5 (595.28) would give 523.28, but `y > 720` was unreachable on a page
+///   that short, so no item was ever a top-band candidate there. Clamping at
+///   720 keeps it that way; a measured 523 would start deleting digits from
+///   the first lines of the page, which is issue #283 moved to another trim.
+/// - A vertically imposed spread (1584) gives 1512 instead of a band that
+///   covered more than half the sheet.
+///
+/// The bottom band is left exactly as calibrated, because #283 is not about
+/// it and nothing measured says it is wrong. Moving it only costs: scaled by
+/// A4's height it becomes 106.3 and swallows the exponent of a displayed
+/// equation whose glyph sits at y=105.5. Anchoring it to a non-zero box
+/// origin does the same thing to a print A4 with a trim CropBox.
+///
+/// The caution runs one way on purpose. A folio left in the Markdown is noise
+/// a reader can see. A digit deleted from a formula or a table is silent, and
+/// this filter cannot undo it. Two things bound what the caution buys, and
+/// both are unchanged here: a page whose items were rotated out of box space
+/// by `correct_rotated_page` has every short digit fall below the bottom band
+/// and become a candidate, geometry or not; and `markdown::postprocess`
+/// removes an isolated digit-only line afterwards without consulting any of
+/// this.
 fn page_number_bands(bounds: Option<&(f32, f32)>) -> (f32, f32) {
-    match bounds {
-        Some(&(y0, y1)) if y1 - y0 > 72.0 => {
-            let scale = (y1 - y0) / PAGE_NUMBER_BAND_REFERENCE_HEIGHT;
-            (
-                y0 + PAGE_NUMBER_BOTTOM_Y * scale,
-                y0 + PAGE_NUMBER_TOP_Y * scale,
-            )
+    let top = match bounds {
+        Some(&(y0, y1)) if y1 - y0 > MIN_USABLE_PAGE_HEIGHT => {
+            (y1 - PAGE_NUMBER_TOP_MARGIN).max(PAGE_NUMBER_TOP_Y)
         }
-        _ => (PAGE_NUMBER_BOTTOM_Y, PAGE_NUMBER_TOP_Y),
-    }
+        _ => PAGE_NUMBER_TOP_Y,
+    };
+    (PAGE_NUMBER_BOTTOM_Y, top)
 }
 const SPREAD_MIN_CONTENT_WIDTH_EM: f32 = 40.0;
 const SPREAD_EDGE_FRACTION: f32 = 0.25;
@@ -1152,7 +1186,7 @@ const ADJACENT_PAGE_MIN_CONTENT_WIDTH_EM: f32 = 26.0;
 
 type ContextualCandidateOccurrence = (u32, f32, Vec<(usize, u32)>);
 
-fn page_number_value(item: &TextItem, page_bounds: &HashMap<u32, (f32, f32)>) -> Option<u32> {
+fn page_number_value(item: &TextItem, page_bounds: &PageVerticalBounds) -> Option<u32> {
     if !matches!(
         item.item_type,
         crate::types::ItemType::Text | crate::types::ItemType::FormField
@@ -1514,7 +1548,7 @@ fn page_number_context_masks(
     items: &[TextItem],
     candidate_values: &[Option<u32>],
     document_page_count: usize,
-    page_bounds: &HashMap<u32, (f32, f32)>,
+    page_bounds: &PageVerticalBounds,
 ) -> (Vec<bool>, Vec<bool>) {
     let mut contextual = vec![false; items.len()];
     let mut explicit_folio = vec![false; items.len()];
@@ -1792,7 +1826,7 @@ fn page_number_context_masks(
 fn page_number_removal_mask(
     items: &[TextItem],
     document_page_count: usize,
-    page_bounds: &HashMap<u32, (f32, f32)>,
+    page_bounds: &PageVerticalBounds,
 ) -> Vec<bool> {
     let candidate_values: Vec<Option<u32>> = items
         .iter()
@@ -1815,7 +1849,7 @@ fn page_number_removal_mask(
 pub(super) fn needs_document_page_number_context(
     items: &[TextItem],
     document_page_count: usize,
-    page_bounds: &HashMap<u32, (f32, f32)>,
+    page_bounds: &PageVerticalBounds,
 ) -> bool {
     let candidate_values: Vec<Option<u32>> = items
         .iter()
@@ -1849,7 +1883,7 @@ pub(crate) fn filter_markdown_page_numbers(
 pub(crate) fn filter_markdown_page_numbers_with_removed_pages(
     items: Vec<TextItem>,
     document_page_count: u32,
-    page_bounds: &HashMap<u32, (f32, f32)>,
+    page_bounds: &PageVerticalBounds,
 ) -> (Vec<TextItem>, HashSet<u32>, Vec<bool>) {
     let remove = page_number_removal_mask(&items, document_page_count as usize, page_bounds);
     let mut removed_pages = HashSet::new();
@@ -2087,7 +2121,9 @@ fn split_column_stragglers(lines: Vec<TextLine>) -> (Vec<TextLine>, Vec<TextLine
 }
 
 pub fn group_into_lines(items: Vec<TextItem>) -> Vec<TextLine> {
-    group_into_lines_with_thresholds(items, &HashMap::new(), &HashSet::new())
+    // Items-only public API: the caller holds no document, so the folio bands
+    // stay at their US-Letter calibration.
+    group_into_lines_with_thresholds(items, &HashMap::new(), &HashSet::new(), &HashMap::new())
 }
 
 /// Group text items into lines without removing numeric page headers or footers.
@@ -2102,6 +2138,12 @@ pub fn group_into_lines_preserving_all_text(items: Vec<TextItem>) -> Vec<TextLin
         &HashSet::new(),
         &HashMap::new(),
         &HashMap::new(),
+        // Nothing is removed on this path, but the bands still decide which
+        // items feed column detection, so this is a real loss of fidelity and
+        // not a case where the geometry is irrelevant. A `TextItem` carries no
+        // page box, so there is nothing to pass at this signature; the caller
+        // that wants consistency has to hand the bounds in from a document.
+        &HashMap::new(),
         false,
     )
 }
@@ -2113,12 +2155,14 @@ pub(crate) fn group_into_lines_with_thresholds(
     items: Vec<TextItem>,
     page_thresholds: &HashMap<u32, f32>,
     table_pages: &HashSet<u32>,
+    page_bounds: &PageVerticalBounds,
 ) -> Vec<TextLine> {
     group_into_lines_with_thresholds_and_charts(
         items,
         page_thresholds,
         table_pages,
         &HashMap::new(),
+        page_bounds,
     )
 }
 
@@ -2132,6 +2176,7 @@ pub(crate) fn group_into_lines_with_thresholds_and_charts(
     page_thresholds: &HashMap<u32, f32>,
     table_pages: &HashSet<u32>,
     chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
+    page_bounds: &PageVerticalBounds,
 ) -> Vec<TextLine> {
     group_into_lines_with_thresholds_and_regions(
         items,
@@ -2139,6 +2184,7 @@ pub(crate) fn group_into_lines_with_thresholds_and_charts(
         table_pages,
         chart_regions,
         &HashMap::new(),
+        page_bounds,
     )
 }
 
@@ -2152,6 +2198,7 @@ pub(crate) fn group_prefiltered_items_into_lines_with_thresholds_and_charts(
     page_thresholds: &HashMap<u32, f32>,
     table_pages: &HashSet<u32>,
     chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
+    page_bounds: &PageVerticalBounds,
 ) -> Vec<TextLine> {
     group_into_lines_with_thresholds_and_regions_impl(
         items,
@@ -2159,6 +2206,7 @@ pub(crate) fn group_prefiltered_items_into_lines_with_thresholds_and_charts(
         table_pages,
         chart_regions,
         &HashMap::new(),
+        page_bounds,
         false,
     )
 }
@@ -2169,6 +2217,7 @@ pub(crate) fn group_into_lines_with_thresholds_and_regions(
     table_pages: &HashSet<u32>,
     chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
     image_regions: &HashMap<u32, Vec<super::reading_order::ImageRegion>>,
+    page_bounds: &PageVerticalBounds,
 ) -> Vec<TextLine> {
     group_into_lines_with_thresholds_and_regions_impl(
         items,
@@ -2176,6 +2225,7 @@ pub(crate) fn group_into_lines_with_thresholds_and_regions(
         table_pages,
         chart_regions,
         image_regions,
+        page_bounds,
         true,
     )
 }
@@ -2186,6 +2236,7 @@ pub(crate) fn group_prefiltered_items_into_lines_with_thresholds_and_regions(
     table_pages: &HashSet<u32>,
     chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
     image_regions: &HashMap<u32, Vec<super::reading_order::ImageRegion>>,
+    page_bounds: &PageVerticalBounds,
 ) -> Vec<TextLine> {
     group_into_lines_with_thresholds_and_regions_impl(
         items,
@@ -2193,6 +2244,7 @@ pub(crate) fn group_prefiltered_items_into_lines_with_thresholds_and_regions(
         table_pages,
         chart_regions,
         image_regions,
+        page_bounds,
         false,
     )
 }
@@ -2203,6 +2255,7 @@ fn group_into_lines_with_thresholds_and_regions_impl(
     table_pages: &HashSet<u32>,
     chart_regions: &HashMap<u32, Vec<(f32, f32, f32, f32)>>,
     image_regions: &HashMap<u32, Vec<super::reading_order::ImageRegion>>,
+    page_bounds: &PageVerticalBounds,
     filter_page_numbers: bool,
 ) -> Vec<TextLine> {
     if items.is_empty() {
@@ -2223,7 +2276,7 @@ fn group_into_lines_with_thresholds_and_regions_impl(
             .map(|item| item.page as usize)
             .max()
             .unwrap_or(0);
-        let remove = page_number_removal_mask(&items, observed_page_count, &HashMap::new());
+        let remove = page_number_removal_mask(&items, observed_page_count, page_bounds);
         items
             .into_iter()
             .zip(remove)
@@ -2244,10 +2297,13 @@ fn group_into_lines_with_thresholds_and_regions_impl(
         let page_items: Vec<TextItem> = items.iter().filter(|i| i.page == page).cloned().collect();
         // Page-edge numeric runs are weak evidence for column geometry. Keep
         // contextual values for line assembly, but prevent their preservation
-        // from changing the page's inferred layout.
+        // from changing the page's inferred layout. Judged with the same bands
+        // as removal: a digit the filter kept as body must not still count as
+        // page furniture here, or the page's layout is inferred from an item
+        // set that does not match the one it emits.
         let column_detection_items: Vec<TextItem> = page_items
             .iter()
-            .filter(|item| page_number_value(item, &HashMap::new()).is_none())
+            .filter(|item| page_number_value(item, page_bounds).is_none())
             .cloned()
             .collect();
         let column_detection_items = column_detection_items.as_slice();
@@ -2304,7 +2360,7 @@ fn group_into_lines_with_thresholds_and_regions_impl(
                 let col_input: Vec<TextItem> = page_items
                     .iter()
                     .filter(|it| {
-                        if page_number_value(it, &HashMap::new()).is_some() {
+                        if page_number_value(it, page_bounds).is_some() {
                             return false;
                         }
                         let cx = it.x + it.width / 2.0;
@@ -3525,17 +3581,28 @@ mod tests {
     }
 
     #[test]
-    fn page_number_bands_scale_with_page_height() {
-        // US Letter keeps the exact historical thresholds.
+    fn page_number_top_band_follows_the_page_top_edge() {
+        // US Letter is the calibration, and must come out untouched.
         assert_eq!(page_number_bands(Some(&(0.0, 792.0))), (100.0, 720.0));
-        // A4 scales both bands so the physical margins match Letter's.
+        // A4: one inch below its own top edge, which is the 122pt of body
+        // text that issue #283 was losing.
         let (bottom, top) = page_number_bands(Some(&(0.0, 841.89)));
-        assert!((bottom - 106.3).abs() < 0.1, "bottom band: {bottom}");
-        assert!((top - 765.35).abs() < 0.1, "top band: {top}");
-        // A box with a nonzero origin shifts the bands with it.
-        let (bottom, top) = page_number_bands(Some(&(100.0, 892.0)));
-        assert!((bottom - 200.0).abs() < 0.1, "offset bottom: {bottom}");
-        assert!((top - 820.0).abs() < 0.1, "offset top: {top}");
+        assert_eq!(bottom, 100.0, "the bottom band does not move");
+        assert!((top - 769.89).abs() < 0.1, "A4 top band: {top}");
+        // A print A4 with a trim CropBox: the band follows the visible top
+        // edge, and the bottom stays put rather than riding up on the origin.
+        let (bottom, top) = page_number_bands(Some(&(9.0, 832.89)));
+        assert_eq!(bottom, 100.0, "a box origin must not move the bottom band");
+        assert!((top - 760.89).abs() < 0.1, "cropped A4 top band: {top}");
+        // A5 is the case the clamp exists for. Nothing on a 595pt page ever
+        // reached y=720, so it had no top band at all; a measured 523 would
+        // invent one over the first lines of text.
+        let (_, top) = page_number_bands(Some(&(0.0, 595.28)));
+        assert_eq!(top, 720.0, "A5 must keep the calibrated, unreachable band");
+        // A vertically imposed spread, where the calibrated band covered more
+        // than half the sheet.
+        let (_, top) = page_number_bands(Some(&(0.0, 1584.0)));
+        assert!((top - 1512.0).abs() < 0.1, "imposed spread top band: {top}");
         // Missing or degenerate geometry keeps the absolute constants.
         assert_eq!(page_number_bands(None), (100.0, 720.0));
         assert_eq!(page_number_bands(Some(&(0.0, 10.0))), (100.0, 720.0));
@@ -3554,45 +3621,65 @@ mod tests {
         // A digit in A4's real top margin is still a candidate.
         let folio = make_item(1, 297.0, 810.0, "7");
         assert_eq!(page_number_value(&folio, &a4), Some(7));
-        // And the bottom band scales the same way: A4 y=103 is inside the
-        // scaled bottom band (106.3), so it stays a candidate.
-        let bottom = make_item(1, 297.0, 103.0, "9");
-        assert_eq!(page_number_value(&bottom, &a4), Some(9));
+        // The bottom band does not move with the page. On the A4 paper this
+        // fix was measured against, the exponent of equation (3) is a lone `2`
+        // whose glyph sits at y=105.5 - inside the band that scaling by A4's
+        // height would produce, and deleted by it. It has to stay body.
+        let exponent = make_item(1, 370.0, 105.5, "2");
+        assert_eq!(
+            page_number_value(&exponent, &a4),
+            None,
+            "A4 y=105.5 is body"
+        );
+        // Below the calibrated depth a folio is still a folio.
+        let folio_foot = make_item(1, 297.0, 95.0, "9");
+        assert_eq!(page_number_value(&folio_foot, &a4), Some(9));
     }
 
     #[test]
-    fn contextual_deep_margin_gate_uses_the_scaled_bands() {
-        // A recurring "42 Company report" footer at A4 y=103 sits inside the
-        // scaled bottom band (106.3) but outside the Letter constant (100).
-        // The repeated-folio gate must judge it with the same scaled bands
-        // as candidacy, so the advancing footer number is still recognized.
-        let a4: HashMap<u32, (f32, f32)> = HashMap::from([
-            (1, (0.0, 841.89)),
-            (2, (0.0, 841.89)),
-            (3, (0.0, 841.89)),
-            (4, (0.0, 841.89)),
-            (5, (0.0, 841.89)),
-        ]);
-        let mut items = Vec::new();
-        for page in 1..=5u32 {
-            items.push(make_item(page, 72.0, 103.0, &format!("{}", 41 + page)));
-            items.push(make_item(page, 90.0, 103.0, "Company report"));
-            items.push(make_item(page, 72.0, 500.0, "Body content that stays"));
-        }
-        let mask = page_number_removal_mask(&items, 5, &a4);
+    fn contextual_deep_margin_gate_uses_the_measured_bands() {
+        // A recurring "42 Company report" running head shares its baseline
+        // with words, so only the deep-margin gate can strip it. That gate
+        // has to read the same bands as candidacy or the two disagree about
+        // what a margin is. A4's top band is 769.89, the calibrated one 720,
+        // so y=800 is margin either way and y=750 only under the calibrated.
+        let a4: HashMap<u32, (f32, f32)> = (1..=5u32).map(|page| (page, (0.0, 841.89))).collect();
+        let running_head = |y: f32| {
+            let mut items = Vec::new();
+            for page in 1..=5u32 {
+                items.push(make_item(page, 72.0, y, &format!("{}", 41 + page)));
+                items.push(make_item(page, 90.0, y, "Company report"));
+                items.push(make_item(page, 72.0, 500.0, "Body content that stays"));
+            }
+            items
+        };
+
+        let deep = running_head(800.0);
+        let mask = page_number_removal_mask(&deep, 5, &a4);
         for page in 0..5usize {
             assert!(
                 mask[page * 3],
-                "advancing footer folio on page {} strips",
+                "advancing folio on page {} strips",
                 page + 1
             );
             assert!(!mask[page * 3 + 2], "body content survives");
         }
-        // Without geometry the y=103 candidates are body (above the absolute
-        // 100pt band), so nothing strips - the gate stays consistent with
-        // candidacy in both modes.
-        let mask = page_number_removal_mask(&items, 5, &HashMap::new());
-        assert!(mask.iter().all(|&removed| !removed));
+
+        // y=750 is below A4's scaled band, so with geometry it is body and
+        // nothing strips; without geometry the absolute 720 makes it margin
+        // again. Either way the gate agrees with candidacy.
+        let shallow = running_head(750.0);
+        assert!(page_number_removal_mask(&shallow, 5, &a4)
+            .iter()
+            .all(|&removed| !removed));
+        let mask = page_number_removal_mask(&shallow, 5, &HashMap::new());
+        for page in 0..5usize {
+            assert!(
+                mask[page * 3],
+                "no-geometry folio on page {} strips",
+                page + 1
+            );
+        }
     }
 
     #[test]
