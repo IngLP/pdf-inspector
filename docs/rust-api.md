@@ -487,6 +487,25 @@ for item in extract_text_with_positions("tagged.pdf")? {
 }
 ```
 
+## Coordinate frame
+
+Positioned items and region inputs share one reference box: PDF points relative
+to the page's **visible page box** — `CropBox ∩ MediaBox` when the page has a
+CropBox, else the MediaBox (a CropBox that does not overlap the MediaBox is
+ignored, and a page without a MediaBox is measured against US Letter).
+`TextItem.x`/`y` use the box's lower-left corner as origin with `y` growing
+upward; region and crop bboxes (`extract_text_in_regions_mem`,
+`extract_tables_in_regions_mem`, `detect_vector_grid_in_region_mem`,
+`TsrTableInput`) use its top-left corner with `y` growing downward, exactly
+like a rendered page image. Converting between the two only needs the box
+height `h`: a positioned `y` becomes `h - y`. For text items `y` is the
+baseline and `height` the font size, so `[x, h - y - height, x + width, h - y]`
+covers the glyph band above the baseline (descenders fall below it); for image,
+link and form-field items `y` is the rect bottom and that box is exact. Pages
+whose CropBox equals the MediaBox with a `(0, 0)` origin are unaffected by this
+convention. Pages whose text is drawn rotated by 90° are normalized into a
+synthetic landscape frame before the shift, and `/Rotate` is not applied.
+
 ## Processing modes
 
 | Mode | What it does | Returns |
@@ -506,7 +525,7 @@ for item in extract_text_with_positions("tagged.pdf")? {
 | `detect_pdf_mem(bytes)` | Fast detection from a byte buffer |
 | `process_pdf_mem_with_options(bytes, options)` | Process from bytes with custom options |
 | `extract_text(path)` | Plain text extraction |
-| `extract_text_with_positions(path)` | Text with X/Y coordinates and font info |
+| `extract_text_with_positions(path)` | Text with X/Y coordinates (visible-page-box frame, see above) and font info |
 | `to_markdown(text, options)` | Convert plain text to Markdown |
 | `to_markdown_from_items(items, options)` | Markdown from pre-extracted `TextItem`s |
 | `to_markdown_from_items_with_rects(items, options, rects)` | Markdown with rectangle-based table detection |
@@ -529,7 +548,7 @@ Low-level detection functions are also available via the `detector` module (`det
 | `DetectionConfig` | Configuration for detection: scan strategy, thresholds |
 | `ScanStrategy` | `EarlyExit`, `Full`, `Sample(n)`, `Pages(vec)` |
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
-| `TextItem` | Text with position, font info, page number, optional structure-tree `mcid`, and `baseline_shift` (non-zero for super/subscript glyph runs; `line_y()` gives the body baseline) |
+| `TextItem` | Text with position (PDF points from the visible page box's lower-left corner), font info, page number, optional structure-tree `mcid`, and `baseline_shift` (non-zero for super/subscript glyph runs; `line_y()` gives the body baseline) |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
