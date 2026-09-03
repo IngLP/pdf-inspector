@@ -95,10 +95,17 @@ pub struct PdfRect {
 
 /// A text item with position information.
 ///
+/// `x`, `y`, `width`, `height` describe the item's axis-aligned box in PDF
+/// points, y-up. For ordinary horizontal text the box runs from the baseline
+/// one em upward and spans the run's advance, which is what every consumer
+/// historically assumed. A run shown with a rotated text matrix gets the
+/// bounding box of its rotated glyph run instead — tall and thin for a
+/// vertical margin stamp — and reports the angle in `rotation`.
+///
 /// # Coordinate frame
 ///
 /// Items returned by the public position APIs (`extract_text_with_positions*`)
-/// are in PDF points relative to the page's **visible page box** —
+/// are relative to the page's **visible page box** —
 /// `CropBox ∩ MediaBox` when the page has a CropBox, else the MediaBox; a
 /// CropBox that does not overlap the MediaBox is ignored, and a page without
 /// a MediaBox is measured against US Letter (see `extractor::page_box`) —
@@ -107,25 +114,61 @@ pub struct PdfRect {
 /// top-left corner with `y` growing downward, so flipping `y` by the box
 /// height lets items and rendered regions be intersected directly. Raw
 /// content-stream coordinates differ whenever the CropBox or MediaBox origin
-/// is not `(0, 0)`. Pages whose text is drawn rotated by 90° are normalized
-/// into a synthetic landscape frame before the shift (see
-/// `content_stream::correct_rotated_page`), and `/Rotate` is not applied.
-/// Inside the markdown pipeline items stay in raw user space.
+/// is not `(0, 0)`. A page whose text is predominantly rotated has its frame
+/// turned so the text reads left-to-right (`PageRotation`, reported by
+/// `extract_text_with_positions_and_rotations_mem`) and the shift is turned
+/// the same way; `/Rotate` is not applied. Inside the markdown pipeline
+/// items stay in raw user space.
 #[derive(Debug, Clone)]
 pub struct TextItem {
     /// The text content
     pub text: String,
-    /// X position of the item's left edge, in PDF points (see the
-    /// coordinate frame note on [`TextItem`])
+    /// Left edge of the item's box, in PDF points from the visible page
+    /// box's left edge (see the coordinate frame note on [`TextItem`]).
     pub x: f32,
-    /// Baseline Y position for text — image, link and form-field items
-    /// carry their rect's bottom edge — in PDF points with `y` growing
-    /// upward (see the coordinate frame note on [`TextItem`])
+    /// Bottom edge of the item's box, in PDF points from the visible page
+    /// box's bottom edge with `y` growing upward (see the coordinate frame
+    /// note on [`TextItem`]). For horizontal text this is the baseline;
+    /// descenders are not included. Image, link and form-field items carry
+    /// their rect's bottom edge.
     pub y: f32,
-    /// Width of text
+    /// Horizontal extent of the box: the advance for horizontal text, the
+    /// em size for a vertical run. Zero only for a horizontal run whose font
+    /// carries no width information (advance unknown).
     pub width: f32,
-    /// Height (approximated from font size)
+    /// Vertical extent of the box: the rendered em size for horizontal
+    /// text, the advance for a vertical run.
     pub height: f32,
+    /// Rotation of the run's baseline in degrees, counter-clockwise from the
+    /// page's +x axis, normalised to `[0, 360)`: `0` for ordinary
+    /// left-to-right text, `90` for text reading bottom-to-top (a margin
+    /// stamp rotated counter-clockwise), `270` for text reading
+    /// top-to-bottom, `180` for upside-down text. Rotation-only matrices
+    /// report exact multiples of 90; skewed matrices (deskewed OCR layers,
+    /// diagonal watermarks) report fractional angles. A reflected text
+    /// matrix has no rotation — its reading direction and its glyphs'
+    /// orientation differ by a half turn — and reports how its glyphs
+    /// stand: `0` for the mirrored-x matrix some producers paint
+    /// right-to-left text with (upright glyphs reading left), `180` for a
+    /// y-flipped one. A negative `Tf` size turns a run around and reads as
+    /// `180`. `0` for items that don't come from a text matrix (images,
+    /// links, form fields, OCR).
+    /// On a page whose text is predominantly rotated the extractor turns
+    /// the coordinate frame so the dominant runs read as `0`; upright
+    /// strays then report `270` on a counter-clockwise page and `90` on a
+    /// clockwise one.
+    pub rotation: f32,
+    /// Whether the run's advance came from font metrics. `false` when the
+    /// font carries no width information (or, for an ActualText span, when
+    /// the advance could not be recovered from the text matrix): the box's
+    /// extent along the baseline is then an estimate of half an em per
+    /// painted glyph (an ActualText span counts the glyphs it covers, not its
+    /// replacement text), laid in the direction the run reads, rather than
+    /// a measurement. A
+    /// font that reports a genuine zero advance keeps `true`. Items that
+    /// don't come from a text matrix (images, links, form fields, OCR)
+    /// always report `true`.
+    pub advance_known: bool,
     /// Font name: the `/BaseFont` family name ("ABCDEF+CMMI10"), which
     /// identifies the actual face (see `extractor::fonts::item_font_name`
     /// for the CID carve-out).
@@ -176,18 +219,81 @@ pub struct TextItem {
 }
 
 impl TextItem {
-    /// Baseline of the visual line this item belongs to: `y` for normal
-    /// text, the anchor's baseline for a super/subscript glyph run (`y`
-    /// minus `baseline_shift`). Line grouping compares this instead of `y`
-    /// so raised and lowered markers stay on their body line.
+    /// Baseline of the visual line this item belongs to: the glyphs'
+    /// baseline for normal text, the anchor's baseline for a super/subscript
+    /// glyph run (`baseline_shift` below it). Line grouping compares this
+    /// instead of `y` so raised and lowered markers stay on their body line
+    /// and upside-down runs of different sizes share theirs.
     pub fn line_y(&self) -> f32 {
-        self.y - self.baseline_shift
+        self.baseline_y() - self.baseline_shift
+    }
+
+    /// The y of the edge the glyphs stand on or hang from: `y` (the box's
+    /// bottom edge) for a run within 45° of upright, `y + height` (the top
+    /// edge) for one within 45° of upside-down (`is_upside_down()`, glyph
+    /// orientation included for reflected matrices). Exact for level runs;
+    /// for oblique ones the baseline is not horizontal and the edge is only
+    /// an approximation of it, which is what line grouping then compares.
+    /// Vertical runs return the box bottom `y`.
+    pub fn baseline_y(&self) -> f32 {
+        if self.is_upside_down() {
+            self.y + self.height
+        } else {
+            self.y
+        }
     }
 
     /// `true` for a glyph run flagged as a super- or subscript of a larger
     /// neighbor (non-zero `baseline_shift`).
     pub fn is_script(&self) -> bool {
         self.baseline_shift != 0.0
+    }
+}
+
+impl TextItem {
+    /// Whether the run reads along the page's x axis rather than its y
+    /// axis: `rotation` closer to `0`/`180` than to `90`/`270`, the same
+    /// 45° split the extractor uses to vote on page rotation. Layout
+    /// heuristics that reason about baselines, word gaps, and column spans
+    /// walk the x axis and assume this; rotated runs (margin stamps, chart
+    /// axis titles, rotated table headers) return `false` and are kept out
+    /// of them. Oblique runs (diagonal watermarks, deskewed OCR lines) are
+    /// deliberately still `true`: the x-axis heuristics are the closest fit
+    /// the pipeline has for them, exactly as before `rotation` existed, and
+    /// callers needing the precise angle read `rotation` directly.
+    pub fn is_horizontal(&self) -> bool {
+        let r = self.rotation.rem_euclid(360.0);
+        let vertical = (r > 45.0 && r < 135.0) || (r > 225.0 && r < 315.0);
+        !vertical
+    }
+
+    /// Whether the run reads along +x: `rotation` within 45° of `0`. The
+    /// x-ascending walks (item merging, line assembly) assume this; an
+    /// upside-down run is `is_horizontal()` but reads towards -x.
+    pub fn is_upright(&self) -> bool {
+        let r = self.rotation.rem_euclid(360.0);
+        r <= 45.0 || r >= 315.0
+    }
+
+    /// Whether the run reads towards -x: `rotation` within 45° of `180`.
+    pub fn is_upside_down(&self) -> bool {
+        self.is_horizontal() && !self.is_upright()
+    }
+
+    /// The item's extent perpendicular to its reading direction: `height`
+    /// for an unrotated item — identical to the historical value, and the
+    /// only meaningful extent for image, link, and OCR boxes — and the
+    /// rendered em (`font_size`) for any rotated run, whose axis-aligned
+    /// box mixes the advance into both dimensions (a long diagonal run is
+    /// not a tall line). Only content-stream runs carry a non-zero
+    /// `rotation`, and they set `font_size` to exactly the em height the
+    /// unrotated case reports.
+    pub(crate) fn cross_extent(&self) -> f32 {
+        if self.rotation == 0.0 {
+            self.height
+        } else {
+            self.font_size
+        }
     }
 }
 
@@ -566,6 +672,8 @@ mod formatting_tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: strikeout,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
@@ -669,6 +777,24 @@ mod formatting_tests {
             "**Yibo Yan<sup>1</sup>, Jiahao Huo**"
         );
         assert_eq!(line.text(), "Yibo Yan<sup>1</sup>, Jiahao Huo");
+    }
+
+    #[test]
+    fn line_y_of_an_upside_down_run_is_its_baseline() {
+        // A 180° run hangs from its box top: that is the baseline its line
+        // groups by, a script offset still applies below it, and an upright
+        // run keeps `y`.
+        let mut run = item("x", 100.0, 20.0, false);
+        run.y = 500.0;
+        run.height = 10.0;
+        run.rotation = 180.0;
+        assert_eq!(run.baseline_y(), 510.0);
+        assert_eq!(run.line_y(), 510.0);
+        run.baseline_shift = 2.0;
+        assert_eq!(run.line_y(), 508.0);
+        run.rotation = 0.0;
+        assert_eq!(run.baseline_y(), 500.0);
+        assert_eq!(run.line_y(), 498.0);
     }
 
     #[test]
@@ -821,5 +947,71 @@ mod formatting_tests {
             "<s>deleted</s>"
         );
         assert_eq!(line.text(), "deleted");
+    }
+
+    #[test]
+    fn is_horizontal_follows_the_baseline_quadrant() {
+        let cases = [
+            (0.0, true),
+            (180.0, true),
+            (90.0, false),
+            (270.0, false),
+            (44.0, true),
+            (46.0, false),
+            (134.0, false),
+            (136.0, true),
+            (359.5, true),
+            (-90.0, false),
+            (450.0, false),
+        ];
+        for (rotation, horizontal) in cases {
+            let mut probe = item("x", 0.0, 10.0, false);
+            probe.rotation = rotation;
+            assert_eq!(
+                probe.is_horizontal(),
+                horizontal,
+                "rotation {rotation} should be horizontal={horizontal}"
+            );
+        }
+    }
+
+    #[test]
+    fn cross_extent_is_the_em_box_whatever_the_orientation() {
+        let mut probe = item("x", 0.0, 10.0, false);
+        probe.height = 12.0;
+        assert_eq!(probe.cross_extent(), 12.0);
+        probe.rotation = 90.0;
+        probe.width = 12.0;
+        probe.height = 200.0;
+        assert_eq!(probe.cross_extent(), 12.0);
+        // A long diagonal run: both box extents carry the advance, the em
+        // is the font size.
+        probe.rotation = 30.0;
+        probe.width = 180.0;
+        probe.height = 110.0;
+        assert_eq!(probe.cross_extent(), 12.0);
+    }
+
+    #[test]
+    fn upright_and_upside_down_split_the_horizontal_half_plane() {
+        let mut probe = item("x", 0.0, 10.0, false);
+        for (rotation, upright, upside_down) in [
+            (0.0, true, false),
+            (44.0, true, false),
+            (316.0, true, false),
+            (180.0, false, true),
+            (136.0, false, true),
+            (224.0, false, true),
+            (90.0, false, false),
+            (270.0, false, false),
+        ] {
+            probe.rotation = rotation;
+            assert_eq!(probe.is_upright(), upright, "upright at {rotation}");
+            assert_eq!(
+                probe.is_upside_down(),
+                upside_down,
+                "upside_down at {rotation}"
+            );
+        }
     }
 }

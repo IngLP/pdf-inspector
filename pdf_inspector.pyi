@@ -103,6 +103,19 @@ class TextItem:
     items), in PDF points from the visible page box's bottom edge."""
     width: float
     height: float
+    """Axis-aligned box in PDF points (y-up): for horizontal text `y` is the
+    baseline and `height` the em size; a rotated run is tall and thin."""
+    rotation: float
+    """Rotation of the run's baseline in degrees counter-clockwise from the
+    page's x axis, in [0, 360): 0 for ordinary horizontal text, 90 for text
+    reading bottom-to-top (a rotated margin stamp), 270 for top-to-bottom,
+    180 for upside-down."""
+    advance_known: bool
+    """Whether the run's advance came from font metrics. False when the font
+    carries no width information (or an ActualText span's advance could not be
+    recovered): the box's extent along the baseline is then an estimate of half
+    an em per painted glyph (an ActualText span counts the glyphs it covers, not
+    its replacement text), not a measurement."""
     font: str
     font_tag: str
     font_size: float
@@ -123,6 +136,31 @@ class TextItem:
     the text is not part of marked content. Join with the (page, mcid) pairs
     from extract_structure_elements to attach structure-tree roles in tagged
     PDFs."""
+
+class PageRotation:
+    """The coordinate frame of a page whose text was predominantly rotated."""
+    page: int
+    """1-indexed page number, matching TextItem.page."""
+    rotation: Literal["ccw", "cw"]
+    """'ccw' when the page's runs read bottom-to-top and the frame was turned so
+    they read left-to-right, 'cw' for runs reading top-to-bottom."""
+
+class PositionedText:
+    """Positioned text plus the frame of every page whose text was turned."""
+    items: list[TextItem]
+    page_rotations: list[PageRotation]
+    """One entry per re-based page; pages absent here are upright and their
+    items are in plain page coordinates."""
+
+def extract_text_with_positions_and_rotations(path: str) -> PositionedText:
+    """Extract positioned text plus the coordinate frame of every page whose
+    text was predominantly rotated (items on such pages are in the turned
+    frame)."""
+    ...
+
+def extract_text_with_positions_and_rotations_bytes(data: bytes) -> PositionedText:
+    """Bytes variant of extract_text_with_positions_and_rotations."""
+    ...
 
 class StructureElement:
     """One structure-tree element reference from a tagged PDF."""

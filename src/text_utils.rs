@@ -4,7 +4,7 @@
 //! No PDF parsing happens here — these are shared across the extraction
 //! and markdown pipelines.
 
-use crate::types::TextItem;
+use crate::types::{ItemType, TextItem};
 use unicode_normalization::UnicodeNormalization;
 
 /// Return whether text is an explicit page-number expression.
@@ -186,11 +186,29 @@ pub(crate) fn sort_rtl_cell_items<T>(
 
 pub(crate) fn sort_line_items(items: &mut [TextItem]) {
     let rtl = is_rtl_text(items.iter().map(|i| &i.text));
+    // An upside-down line of LTR runs (180°) reads towards -x: sort it by its
+    // mirrored position so the fragments come out in reading order. RTL lines
+    // are exempt: they already read in the classic RTL order (descending x),
+    // whichever way their glyphs stand, so mirroring them would reverse it.
+    // Non-text items on the line (links, form fields, images) are axis-aligned
+    // boxes reporting 0° and say nothing about the reading direction.
+    let mut text_runs = items
+        .iter()
+        .filter(|i| matches!(i.item_type, ItemType::Text));
+    let upside_down =
+        !rtl && text_runs.clone().next().is_some() && text_runs.all(|i| i.is_upside_down());
+    let key = |item: &TextItem| {
+        if upside_down {
+            -(item.x + item.width)
+        } else {
+            item.x
+        }
+    };
     if rtl {
-        items.sort_by(|a, b| b.x.total_cmp(&a.x));
+        items.sort_by(|a, b| key(b).total_cmp(&key(a)));
         restore_embedded_ltr_runs(items, |i| i.text.as_str());
     } else {
-        items.sort_by(|a, b| a.x.total_cmp(&b.x));
+        items.sort_by(|a, b| key(a).total_cmp(&key(b)));
     }
 }
 
@@ -611,16 +629,33 @@ pub(crate) fn effective_font_size(base_size: f32, text_matrix: &[f32; 6]) -> f32
     let scale_y = (text_matrix[2].powi(2) + text_matrix[3].powi(2)).sqrt();
     // Use the larger of the two scales (usually they're equal for non-rotated text)
     let scale = scale_x.max(scale_y);
-    base_size * scale
+    // A negative `Tf` size turns the glyphs around; their size is still
+    // their size (the geometry reads the direction from the advance).
+    base_size.abs() * scale
 }
 
-/// Estimate the width of a text item, falling back to a character-count heuristic when width is 0.
+/// The item's horizontal extent for layout heuristics. The box already
+/// holds an estimate for runs whose font carries no width metrics (laid
+/// along the run at extraction, flagged by `TextItem::advance_known ==
+/// false`), so a positive width is taken as is. A box without one gets the
+/// classic half-em-per-character stand-in, as it always did — whether the
+/// width is negative (a merged item whose fragments ran backwards) or a
+/// measured zero: a glyph drawn with a zero advance (an Arabic hamza or a
+/// combining mark positioned by hand) still covers a glyph's worth of page,
+/// and column detection and region routing need that footprint or they
+/// displace it into another line and split the word. The stand-in is a
+/// layout extent only; the item's box keeps its measured width.
 pub(crate) fn effective_width(item: &TextItem) -> f32 {
     if item.width > 0.0 {
         item.width
     } else {
         item.text.chars().count() as f32 * item.font_size * 0.5
     }
+}
+
+/// The item's vertical extent — the counterpart of `effective_width`.
+pub(crate) fn effective_height(item: &TextItem) -> f32 {
+    item.height
 }
 
 pub(crate) fn is_cid_font(font: &str) -> bool {
@@ -918,7 +953,16 @@ pub(crate) fn should_join_items(
     }
 
     // When we have accurate width from font metrics, use a tight threshold
-    if prev_item.width > 0.0 {
+    // Only measured widths earn the tight threshold: a width-less font's
+    // box is a half-em-per-glyph estimate (`advance_known == false`), which
+    // stays on the loose heuristic it always used. So does a rotated pair:
+    // a vertical run's `width` is its em, not its advance, and the x gap
+    // below says nothing about how far apart the runs read.
+    if prev_item.width > 0.0
+        && prev_item.advance_known
+        && prev_item.is_upright()
+        && curr_item.is_upright()
+    {
         let gap = if prev_item.x <= curr_item.x {
             // LTR: prev is left of curr
             curr_item.x - (prev_item.x + prev_item.width)
@@ -1327,6 +1371,8 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
@@ -1528,6 +1574,8 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
@@ -1651,6 +1699,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -1731,6 +1781,8 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
@@ -1809,6 +1861,129 @@ mod tests {
             !should_join_items(&ized, &fo, threshold),
             "ized→fo: ratio={:.3}, should split (word boundary)",
             (fo.x - (ized.x + ized.width)) / fs
+        );
+    }
+
+    fn geometry_item(width: f32, font_size: f32, rotation: f32) -> TextItem {
+        TextItem {
+            baseline_shift: 0.0,
+            text: "abcd".to_string(),
+            x: 0.0,
+            y: 0.0,
+            width,
+            height: font_size,
+            rotation,
+            advance_known: true,
+            font: String::new(),
+            font_tag: String::new(),
+            font_size,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type: ItemType::Text,
+            mcid: None,
+        }
+    }
+
+    #[test]
+    fn join_threshold_ignores_a_vertical_runs_em_width() {
+        // For a vertical run `width` is its em, so the tight measured-width
+        // path would read the x gap to the next run as a word boundary. The
+        // pair falls back to the loose heuristic instead — which the same
+        // geometry laid out upright does not.
+        let mut prev = geometry_item(10.0, 30.0, 90.0);
+        prev.text = "ab".to_string();
+        prev.x = 100.0;
+        prev.font_size = 10.0;
+        let mut curr = geometry_item(10.0, 30.0, 90.0);
+        curr.text = "cd".to_string();
+        curr.x = 112.5;
+        curr.font_size = 10.0;
+        assert!(should_join_items(&prev, &curr, 0.1));
+
+        prev.rotation = 0.0;
+        prev.height = 10.0;
+        curr.rotation = 0.0;
+        curr.height = 10.0;
+        assert!(!should_join_items(&prev, &curr, 0.1));
+    }
+
+    #[test]
+    fn upside_down_lines_sort_right_to_left() {
+        // A 180° run reads towards -x: the fragment painted first sits at
+        // the largest x and must come first.
+        let mut hello = geometry_item(30.0, 10.0, 180.0);
+        hello.text = "HELLO".to_string();
+        hello.x = 300.0;
+        let mut world = geometry_item(30.0, 10.0, 180.0);
+        world.text = "WORLD".to_string();
+        world.x = 260.0;
+        let mut items = vec![world.clone(), hello.clone()];
+        sort_line_items(&mut items);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["HELLO", "WORLD"]);
+
+        // Mixed or upright lines keep ascending x.
+        items[0].rotation = 0.0;
+        sort_line_items(&mut items);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["WORLD", "HELLO"]);
+
+        // A link box on the line is axis-aligned (0°) and must not defeat the
+        // mirrored sort of the text around it.
+        let mut link = geometry_item(5.0, 10.0, 0.0);
+        link.text = "link".to_string();
+        link.x = 291.0;
+        link.item_type = ItemType::Link("https://example.com/".to_string());
+        let mut items = vec![world, link, hello];
+        sort_line_items(&mut items);
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(texts, ["HELLO", "link", "WORLD"]);
+
+        // An RTL line whose runs report 180° keeps the classic RTL order,
+        // first word at the largest x: mirroring it would reverse the text.
+        let mut first = geometry_item(30.0, 10.0, 180.0);
+        first.text = "\u{05E9}\u{05DC}\u{05D5}\u{05DD}".to_string();
+        first.x = 140.0;
+        let mut second = geometry_item(30.0, 10.0, 180.0);
+        second.text = "\u{05E2}\u{05D5}\u{05DC}\u{05DD}".to_string();
+        second.x = 100.0;
+        let mut items = vec![second.clone(), first.clone()];
+        sort_line_items(&mut items);
+        assert_eq!(items[0].text, first.text);
+        assert_eq!(items[1].text, second.text);
+    }
+
+    #[test]
+    fn extent_helpers_pass_the_box_through() {
+        // Estimates for width-less fonts are laid into the box at extraction
+        // and flagged, so the helpers never second-guess a positive width;
+        // a box without one — measured zero or backwards — falls back to
+        // half an em per character so layout has a footprint to reason with.
+        let mut zero = geometry_item(0.0, 10.0, 0.0);
+        zero.text = "ab".to_string();
+        zero.font_size = 10.0;
+        assert!(zero.advance_known);
+        assert_eq!(
+            (effective_width(&zero), effective_height(&zero)),
+            (10.0, 10.0)
+        );
+        let mut backwards = zero.clone();
+        backwards.width = -1.7;
+        assert_eq!(effective_width(&backwards), 10.0);
+        let mut unmeasured = zero.clone();
+        unmeasured.advance_known = false;
+        assert_eq!(effective_width(&unmeasured), 10.0);
+        let mut estimated = geometry_item(20.0, 10.0, 0.0);
+        estimated.advance_known = false;
+        assert_eq!(effective_width(&estimated), 20.0);
+        let mut short = geometry_item(6.0, 10.0, 45.0);
+        short.height = 5.0;
+        assert_eq!(
+            (effective_width(&short), effective_height(&short)),
+            (6.0, 5.0)
         );
     }
 }

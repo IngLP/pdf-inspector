@@ -5,6 +5,9 @@ use pdf_inspector::extractor::group_into_lines;
 use pdf_inspector::types::ItemType;
 use pdf_inspector::types::TextLine;
 use pdf_inspector::{
+    collect_text_in_region_in_frame, extract_text_with_positions_and_rotations_mem, PageRotation,
+};
+use pdf_inspector::{
     detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
     extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
     extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
@@ -297,6 +300,8 @@ fn make_text_item(text: &str, x: f32, y: f32, font_size: f32, page: u32) -> Text
         is_italic: false,
         is_underline: false,
         is_strikeout: false,
+        rotation: 0.0,
+        advance_known: true,
         item_type: ItemType::Text,
         mcid: None,
         baseline_shift: 0.0,
@@ -326,6 +331,8 @@ fn make_text_item_with_font(
         is_italic: is_italic_font(font),
         is_underline: false,
         is_strikeout: false,
+        rotation: 0.0,
+        advance_known: true,
         item_type: ItemType::Text,
         mcid: None,
         baseline_shift: 0.0,
@@ -4612,6 +4619,179 @@ fn test_extract_pages_markdown_agrees_with_classify_on_scan_with_native_header()
 }
 
 // =========================================================================
+// Rotated text-run geometry (fixture: rotated_margin_stamp.pdf)
+// =========================================================================
+
+/// An upright Letter page with a title, a two-column body, and a 20pt
+/// arXiv-style identifier shown with a 90° counter-clockwise text matrix
+/// (`0 1 -1 0 32 200 Tm`) along the left margin, reading bottom to top.
+const ROTATED_STAMP_FIXTURE: &str = "tests/fixtures/rotated_margin_stamp.pdf";
+const ROTATED_STAMP_TEXT: &str = "arXiv:2301.00001v1 [cs.CL] 1 Jan 2023";
+
+#[test]
+fn test_rotated_margin_run_has_tall_thin_box_and_rotation() {
+    let items = extract_text_with_positions(ROTATED_STAMP_FIXTURE).unwrap();
+    let stamp = items
+        .iter()
+        .find(|i| i.text == ROTATED_STAMP_TEXT)
+        .expect("stamp item");
+    assert!(
+        (stamp.rotation - 90.0).abs() < 1e-3,
+        "rotation = {}",
+        stamp.rotation
+    );
+    assert!(!stamp.is_horizontal());
+    // The glyphs extend one em to the left of the baseline drawn at x = 32,
+    // and the run starts at y = 200 then advances up the page.
+    assert!((stamp.x - 12.0).abs() < 0.05, "x = {}", stamp.x);
+    assert!((stamp.width - 20.0).abs() < 0.05, "width = {}", stamp.width);
+    assert!((stamp.y - 200.0).abs() < 0.05, "y = {}", stamp.y);
+    assert!(
+        stamp.height > 300.0 && stamp.height < 500.0,
+        "height = {}",
+        stamp.height
+    );
+    assert!(
+        stamp.height > 10.0 * stamp.width,
+        "box must be tall and thin, got {}x{}",
+        stamp.width,
+        stamp.height
+    );
+    assert_eq!(stamp.font_size, 20.0);
+
+    // Upright body text keeps the historical box: baseline y, em height,
+    // advance width, no rotation.
+    let body = items
+        .iter()
+        .find(|i| i.text.starts_with("The quick brown fox"))
+        .expect("body item");
+    assert_eq!(body.rotation, 0.0);
+    assert!(body.is_horizontal());
+    assert_eq!((body.x, body.y, body.height), (72.0, 690.0, 11.0));
+    assert!(
+        body.width > 150.0 && body.width < 250.0,
+        "width = {}",
+        body.width
+    );
+
+    assert!(
+        items
+            .iter()
+            .filter(|i| !i.text.trim().is_empty())
+            .all(|i| i.width > 0.0),
+        "no run with glyphs may be zero-width"
+    );
+}
+
+#[test]
+fn test_rotated_margin_run_is_assigned_to_margin_region_only() {
+    let buf = std::fs::read(ROTATED_STAMP_FIXTURE).unwrap();
+    // Top-left page coordinates, as layout models report them: a left-margin
+    // strip next to the body area. Before the geometry fix the stamp's
+    // zero width was replaced by a chars × 0.5em phantom that crossed into
+    // the body box, so the body region won the exclusive assignment and the
+    // margin region came back empty.
+    let margin = [0.0, 0.0, 50.0, 792.0];
+    let body = [60.0, 0.0, 612.0, 792.0];
+    let results = extract_text_in_regions_mem(&buf, &[(0, vec![margin, body])]).unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].regions.len(), 2);
+    let (margin_text, body_text) = (&results[0].regions[0], &results[0].regions[1]);
+    assert_eq!(margin_text.text.trim(), ROTATED_STAMP_TEXT);
+    assert!(!margin_text.needs_ocr);
+    assert!(
+        !body_text.text.contains("arXiv"),
+        "stamp leaked into the body region: {:?}",
+        body_text.text
+    );
+    assert!(body_text.text.contains("The quick brown fox"));
+    assert!(body_text.text.contains("title line across both columns."));
+
+    // The margin box alone recovers the same stamp: pairing it with the body
+    // box must not change the answer.
+    let solo = extract_text_in_regions_mem(&buf, &[(0, vec![margin])]).unwrap();
+    assert_eq!(solo[0].regions[0].text.trim(), ROTATED_STAMP_TEXT);
+}
+
+#[test]
+fn test_clockwise_rotated_page_reads_in_order_and_regions_follow() {
+    // Top-to-bottom runs (`Tm = [0 -1 1 0]`): a page rotated clockwise. The
+    // first line runs down the page at x = 300, the next line sits to its
+    // LEFT at x = 270. The frame must be turned clockwise (not the fixed
+    // counter-clockwise turn, which mirrors both word and line order), and
+    // region boxes given in page coordinates must follow that frame.
+    let content = "BT /F1 12 Tf 0 -1 1 0 300 700 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 300 655 Tm (WORLD) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 700 Tm (SECOND) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 644 Tm (LINE) Tj ET";
+    let buf = make_text_pdf(content, "0 0 612 792");
+
+    let items = extract_text_with_positions_mem(&buf).unwrap();
+    let find = |t: &str| {
+        items
+            .iter()
+            .find(|i| i.text.contains(t))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no {t} in {:?}",
+                    items.iter().map(|i| &i.text).collect::<Vec<_>>()
+                )
+            })
+    };
+    let (hello, second) = (find("HELLO"), find("SECOND"));
+    assert!(
+        items.iter().all(|i| i.rotation == 0.0 && i.is_horizontal()),
+        "{items:?}"
+    );
+    assert!(hello.y > second.y, "first line must stack above the second");
+    assert!(
+        (hello.x - second.x).abs() < 0.5,
+        "both lines start at the same left edge"
+    );
+
+    let full = extract_text_in_regions_mem(&buf, &[(0, vec![[0.0, 0.0, 1200.0, 1200.0]])]).unwrap();
+    let text = &full[0].regions[0].text;
+    let at = |t: &str| text.find(t).unwrap_or_else(|| panic!("no {t} in {text:?}"));
+    assert!(at("HELLO") < at("WORLD") && at("WORLD") < at("SECOND") && at("SECOND") < at("LINE"));
+
+    // A top-left page box around the first line only (page x 290..320,
+    // y 87..192 from the top) must select exactly that line.
+    let first_line =
+        extract_text_in_regions_mem(&buf, &[(0, vec![[290.0, 87.0, 320.0, 192.0]])]).unwrap();
+    let text = &first_line[0].regions[0].text;
+    assert!(text.contains("HELLO") && text.contains("WORLD"), "{text:?}");
+    assert!(
+        !text.contains("SECOND") && !text.contains("LINE"),
+        "{text:?}"
+    );
+
+    // Callers holding the items can ask for each page's frame and pass it
+    // explicitly to the region helper instead of relying on inference.
+    let (items, rotations) = extract_text_with_positions_and_rotations_mem(&buf).unwrap();
+    assert_eq!(rotations.get(&1), Some(&PageRotation::Cw));
+    let text =
+        collect_text_in_region_in_frame(&items, 290.0, 87.0, 320.0, 192.0, 792.0, PageRotation::Cw);
+    assert!(
+        text.contains("HELLO") && !text.contains("SECOND"),
+        "{text:?}"
+    );
+
+    let md = process_pdf_mem(&buf).unwrap().markdown.unwrap_or_default();
+    assert!(
+        md.find("HELLO").unwrap() < md.find("WORLD").unwrap(),
+        "{md}"
+    );
+    assert!(
+        md.find("WORLD").unwrap() < md.find("SECOND").unwrap(),
+        "{md}"
+    );
+    assert!(
+        md.find("SECOND").unwrap() < md.find("LINE").unwrap(),
+        "{md}"
+    );
+}
+
+// =========================================================================
 // Coordinate frame: positions and regions share the visible page box
 // =========================================================================
 
@@ -4795,6 +4975,57 @@ fn test_region_table_apis_use_visible_box_frame() {
             region.text.contains(tok),
             "expected {tok} in {}",
             region.text
+        );
+    }
+}
+
+#[test]
+fn test_turned_page_positions_are_independent_of_the_box_origin() {
+    // The clockwise page of `test_clockwise_rotated_page_reads_in_order_and_regions_follow`
+    // drawn on a MediaBox whose origin is (50, 60), content shifted by the
+    // same amount: every item must report exactly the positions of its
+    // origin-0 twin — the visible-box shift is turned with the frame — and
+    // the region API must read that frame.
+    let plain_content = "BT /F1 12 Tf 0 -1 1 0 300 700 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 300 655 Tm (WORLD) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 700 Tm (SECOND) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 270 644 Tm (LINE) Tj ET";
+    let shifted_content = "BT /F1 12 Tf 0 -1 1 0 350 760 Tm (HELLO) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 350 715 Tm (WORLD) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 320 760 Tm (SECOND) Tj ET\n\
+BT /F1 12 Tf 0 -1 1 0 320 704 Tm (LINE) Tj ET";
+    let plain = make_text_pdf(plain_content, "0 0 612 792");
+    let shifted = make_text_pdf(shifted_content, "50 60 662 852");
+    let (plain_items, plain_frames) =
+        extract_text_with_positions_and_rotations_mem(&plain).unwrap();
+    let (shifted_items, shifted_frames) =
+        extract_text_with_positions_and_rotations_mem(&shifted).unwrap();
+    assert_eq!(plain_frames.get(&1), Some(&PageRotation::Cw));
+    assert_eq!(shifted_frames.get(&1), Some(&PageRotation::Cw));
+    let find = |items: &[TextItem], text: &str| -> TextItem {
+        items
+            .iter()
+            .find(|i| i.text.contains(text))
+            .cloned()
+            .unwrap_or_else(|| panic!("no {text} in {items:?}"))
+    };
+    for text in ["HELLO", "WORLD", "SECOND", "LINE"] {
+        let (a, b) = (find(&plain_items, text), find(&shifted_items, text));
+        assert_close(a.x, b.x);
+        assert_close(a.y, b.y);
+        assert_close(a.width, b.width);
+        assert_close(a.height, b.height);
+        assert_eq!(a.rotation, b.rotation);
+    }
+
+    // The top-left region around the first line selects exactly that line
+    // in both documents.
+    for buf in [&plain, &shifted] {
+        let text = region_text(buf, [290.0, 87.0, 320.0, 192.0]);
+        assert!(text.contains("HELLO") && text.contains("WORLD"), "{text:?}");
+        assert!(
+            !text.contains("SECOND") && !text.contains("LINE"),
+            "{text:?}"
         );
     }
 }

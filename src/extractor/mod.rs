@@ -6,6 +6,7 @@ mod base14;
 mod content_decode;
 pub(crate) mod content_stream;
 mod fonts;
+pub(crate) mod geometry;
 mod layout;
 mod links;
 pub(crate) mod page_box;
@@ -135,7 +136,7 @@ pub(crate) fn extract_text_with_positions_and_rects_with_password<P: AsRef<Path>
     crate::validate_pdf_file(&path)?;
     let (doc, _) = crate::load_document_from_path_with_password(&path, password)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages) =
+    let (extraction, _thresholds, _gid_pages, _page_rotations) =
         extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter)?;
     Ok(extraction)
 }
@@ -156,6 +157,26 @@ pub fn extract_text_with_positions_mem_pages(
     Ok(items)
 }
 
+/// Extract text with positions from a memory buffer, together with the
+/// coordinate frame of every page whose text was predominantly rotated.
+///
+/// Such pages are re-based so their dominant runs read left-to-right (see
+/// [`PageRotation`](crate::PageRotation)); their items live in the turned
+/// frame, and region boxes given in page coordinates must be turned the same
+/// way with [`collect_text_in_region_in_frame`](crate::collect_text_in_region_in_frame).
+/// Pages absent from the map are upright. Keys are 1-indexed like
+/// `TextItem::page`.
+pub fn extract_text_with_positions_and_rotations_mem(
+    buffer: &[u8],
+) -> Result<(Vec<TextItem>, HashMap<u32, geometry::PageRotation>), PdfError> {
+    crate::validate_pdf_bytes(buffer)?;
+    let (doc, _) = crate::load_document_from_mem(buffer)?;
+    let font_cmaps = FontCMaps::from_doc(&doc);
+    let ((items, _rects, _lines), _thresholds, _gid_pages, page_rotations) =
+        extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, None)?;
+    Ok((items, page_rotations))
+}
+
 /// Extract text with positions and rectangles from memory buffer.
 pub(crate) fn extract_text_with_positions_mem_and_rects(
     buffer: &[u8],
@@ -164,7 +185,7 @@ pub(crate) fn extract_text_with_positions_mem_and_rects(
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, _thresholds, _gid_pages) =
+    let (extraction, _thresholds, _gid_pages, _page_rotations) =
         extract_positioned_text_from_doc_in_page_box(&doc, &font_cmaps, page_filter)?;
     Ok(extraction)
 }
@@ -177,9 +198,10 @@ pub(crate) struct PageBoxExtraction {
     pub(crate) lines: Vec<PdfLine>,
     /// Fonts with unresolvable gid-encoded glyphs were encountered.
     pub(crate) has_gid_fonts: bool,
-    /// The page's text was rotation-normalized (see
-    /// `content_stream::correct_rotated_page`).
-    pub(crate) coords_rotated: bool,
+    /// How the page's frame was turned so its text reads left-to-right
+    /// (see `content_stream::correct_rotated_page`); `Upright` when it was
+    /// not.
+    pub(crate) coords_rotated: geometry::PageRotation,
     /// Invisible (Tr 3) text was skipped and could be recovered with
     /// `include_invisible`.
     pub(crate) skipped_invisible: bool,
@@ -231,6 +253,11 @@ pub(crate) fn extract_page_text_items_in_page_box(
 /// Per-page adaptive join thresholds from Canva-style letter-spacing detection.
 pub(crate) type PageThresholds = HashMap<u32, f32>;
 
+/// Pages (1-indexed, like `TextItem::page`) whose coordinate frame was turned
+/// because their text is predominantly rotated; pages absent from the map
+/// are upright.
+pub(crate) type PageRotations = HashMap<u32, geometry::PageRotation>;
+
 /// Extract positioned text, rectangles, and line segments from a pre-loaded document.
 ///
 /// Also returns per-page adaptive join thresholds for Canva-style pages.
@@ -238,7 +265,7 @@ pub(crate) fn extract_positioned_text_from_doc(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -251,11 +278,14 @@ pub(crate) fn extract_positioned_text_from_doc(
 
 /// [`extract_positioned_text_from_doc`] with every page's geometry shifted
 /// into the visible-page-box frame — what the public position APIs return.
+/// A page whose frame was turned (see `PageRotation`) gets the equivalently
+/// turned shift, so its items, links and form fields agree with region
+/// bounds computed from the visible box.
 pub(crate) fn extract_positioned_text_from_doc_in_page_box(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -285,7 +315,7 @@ pub(crate) fn extract_positioned_text_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
     extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, false)
 }
 
@@ -294,7 +324,7 @@ pub(crate) fn extract_positioned_text_include_invisible_with_folio_context(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
     extract_positioned_text_with_folio_context_impl(doc, font_cmaps, page_filter, true)
 }
 
@@ -303,7 +333,7 @@ fn extract_positioned_text_with_folio_context_impl(
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
     let Some(required_pages) = page_filter else {
         return extract_positioned_text_impl(
             doc,
@@ -319,6 +349,7 @@ fn extract_positioned_text_with_folio_context_impl(
         (mut selected_items, mut selected_rects, mut selected_lines),
         mut page_thresholds,
         mut gid_encoded_pages,
+        mut page_rotations,
     ) = extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -332,6 +363,7 @@ fn extract_positioned_text_with_folio_context_impl(
             (selected_items, selected_rects, selected_lines),
             page_thresholds,
             gid_encoded_pages,
+            page_rotations,
         ));
     }
 
@@ -341,24 +373,30 @@ fn extract_positioned_text_with_folio_context_impl(
         .copied()
         .filter(|page| !required_pages.contains(page))
         .collect();
-    let ((context_items, context_rects, context_lines), context_thresholds, context_gid_pages) =
-        extract_positioned_text_impl(
-            doc,
-            font_cmaps,
-            Some(&context_pages),
-            include_invisible,
-            Some(required_pages),
-            CoordinateFrame::UserSpace,
-        )?;
+    let (
+        (context_items, context_rects, context_lines),
+        context_thresholds,
+        context_gid_pages,
+        context_rotations,
+    ) = extract_positioned_text_impl(
+        doc,
+        font_cmaps,
+        Some(&context_pages),
+        include_invisible,
+        Some(required_pages),
+        CoordinateFrame::UserSpace,
+    )?;
     selected_items.extend(context_items);
     selected_rects.extend(context_rects);
     selected_lines.extend(context_lines);
     page_thresholds.extend(context_thresholds);
     gid_encoded_pages.extend(context_gid_pages);
+    page_rotations.extend(context_rotations);
     Ok((
         (selected_items, selected_rects, selected_lines),
         page_thresholds,
         gid_encoded_pages,
+        page_rotations,
     ))
 }
 
@@ -368,7 +406,7 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     doc: &Document,
     font_cmaps: &FontCMaps,
     required_pages: &HashSet<u32>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
     extract_positioned_text_impl(
         doc,
         font_cmaps,
@@ -386,7 +424,7 @@ fn extract_positioned_text_impl(
     include_invisible: bool,
     required_pages: Option<&HashSet<u32>>,
     frame: CoordinateFrame,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, PageRotations), PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
@@ -396,6 +434,9 @@ fn extract_positioned_text_impl(
     // Embedded-font style flags are document-scoped: the same font program
     // is shared across pages, so parse it once, not once per page.
     let mut style_cache = FontStyleCache::new();
+    // Pages whose coordinate frame was turned (see `PageRotation`): the
+    // document-level annotation items appended below must follow.
+    let mut page_rotations: PageRotations = HashMap::new();
     // Visible page box per extracted page, for the form-field shift below.
     let mut page_boxes: HashMap<u32, PageBox> = HashMap::new();
 
@@ -432,78 +473,81 @@ fn extract_positioned_text_impl(
                 }
                 Err(error) => return Err(error),
             };
+        if coords_rotated != geometry::PageRotation::Upright {
+            page_rotations.insert(*page_num, coords_rotated);
+        }
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
         // outside the CropBox. Extracting it interleaves invisible text into
-        // the page and poisons font statistics. Rotated pages are left alone
-        // — their item coordinates are already transformed out of box space.
+        // the page and poisons font statistics. On a turned page the box is
+        // turned the same way, so the test runs in the items' own frame.
         let page_box = visible_page_box(doc, page_id);
         let mut clipped_box: Option<(f32, f32, f32, f32)> = None;
-        if !coords_rotated {
-            if let Some((bx0, by0, bx1, by1)) = page_box.map(|b| (b.x0, b.y0, b.x1, b.y1)) {
-                const TOL: f32 = 6.0;
-                let outside = |it: &TextItem| {
-                    let cx = it.x + it.width / 2.0;
-                    !(cx >= bx0 - TOL && cx <= bx1 + TOL && it.y >= by0 - TOL && it.y <= by1 + TOL)
-                };
-                // Only clip when the off-page material reads as coherent text
-                // (neighboring-page paragraphs). Curved/rotated display text
-                // leaves short glyph fragments with artifact coordinates
-                // outside the box, and those must stay.
-                let off: Vec<&TextItem> = items.iter().filter(|it| outside(it)).collect();
-                // Judge by character mass: paragraphs are dominated by long
-                // word runs even when interleaved with short math fragments,
-                // while glyph-confetti is short items through and through.
-                let total_chars: usize = off.iter().map(|it| it.text.trim().chars().count()).sum();
-                let wordy_chars: usize = off
-                    .iter()
-                    .map(|it| it.text.trim().chars().count())
-                    .filter(|&n| n >= 4)
-                    .sum();
-                // Genuine neighboring-page content is cleanly separated from
-                // on-page text. When an off-page item continues an on-page
-                // line (same baseline, near-adjacent x), the coordinates are
-                // artifacts of transforms we mis-model — don't clip those.
-                let straddles = off.iter().any(|o| {
-                    items.iter().any(|i| {
-                        !outside(i)
-                            && (i.y - o.y).abs() <= 2.0
-                            && (o.x - (i.x + i.width)).abs() <= 10.0
-                    })
-                });
-                let coherent =
-                    off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1) && !straddles;
-                if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
-                    let before = items.len();
-                    items.retain(|it| !outside(it));
-                    if items.len() < before {
-                        debug!(
-                            "page {}: clipped {} items outside page box ({:.0},{:.0})-({:.0},{:.0})",
-                            page_num,
-                            before - items.len(),
-                            bx0,
-                            by0,
-                            bx1,
-                            by1
-                        );
-                        // Only prune off-page geometry when off-page text
-                        // existed — same neighboring-page content.
-                        let overlaps = |x: f32, y: f32, w: f32, h: f32| {
-                            let (x0, x1) = if w < 0.0 { (x + w, x) } else { (x, x + w) };
-                            let (y0, y1) = if h < 0.0 { (y + h, y) } else { (y, y + h) };
-                            x0 < bx1 + TOL && x1 > bx0 - TOL && y0 < by1 + TOL && y1 > by0 - TOL
-                        };
-                        rects.retain(|r| overlaps(r.x, r.y, r.width, r.height));
-                        clipped_box = Some((bx0, by0, bx1, by1));
-                        lines.retain(|l| {
-                            overlaps(
-                                l.x1.min(l.x2),
-                                l.y1.min(l.y2),
-                                (l.x2 - l.x1).abs(),
-                                (l.y2 - l.y1).abs(),
-                            )
-                        });
-                    }
+        let clip_box = page_box.map(|b| {
+            let (mut x, mut y, mut w, mut h) = (b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
+            coords_rotated.rotate_box(&mut x, &mut y, &mut w, &mut h);
+            (x, y, x + w, y + h)
+        });
+        if let Some((bx0, by0, bx1, by1)) = clip_box {
+            const TOL: f32 = 6.0;
+            let outside = |it: &TextItem| {
+                let cx = it.x + it.width / 2.0;
+                !(cx >= bx0 - TOL && cx <= bx1 + TOL && it.y >= by0 - TOL && it.y <= by1 + TOL)
+            };
+            // Only clip when the off-page material reads as coherent text
+            // (neighboring-page paragraphs). Curved/rotated display text
+            // leaves short glyph fragments with artifact coordinates
+            // outside the box, and those must stay.
+            let off: Vec<&TextItem> = items.iter().filter(|it| outside(it)).collect();
+            // Judge by character mass: paragraphs are dominated by long
+            // word runs even when interleaved with short math fragments,
+            // while glyph-confetti is short items through and through.
+            let total_chars: usize = off.iter().map(|it| it.text.trim().chars().count()).sum();
+            let wordy_chars: usize = off
+                .iter()
+                .map(|it| it.text.trim().chars().count())
+                .filter(|&n| n >= 4)
+                .sum();
+            // Genuine neighboring-page content is cleanly separated from
+            // on-page text. When an off-page item continues an on-page
+            // line (same baseline, near-adjacent x), the coordinates are
+            // artifacts of transforms we mis-model — don't clip those.
+            let straddles = off.iter().any(|o| {
+                items.iter().any(|i| {
+                    !outside(i) && (i.y - o.y).abs() <= 2.0 && (o.x - (i.x + i.width)).abs() <= 10.0
+                })
+            });
+            let coherent = off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1) && !straddles;
+            if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
+                let before = items.len();
+                items.retain(|it| !outside(it));
+                if items.len() < before {
+                    debug!(
+                        "page {}: clipped {} items outside page box ({:.0},{:.0})-({:.0},{:.0})",
+                        page_num,
+                        before - items.len(),
+                        bx0,
+                        by0,
+                        bx1,
+                        by1
+                    );
+                    // Only prune off-page geometry when off-page text
+                    // existed — same neighboring-page content.
+                    let overlaps = |x: f32, y: f32, w: f32, h: f32| {
+                        let (x0, x1) = if w < 0.0 { (x + w, x) } else { (x, x + w) };
+                        let (y0, y1) = if h < 0.0 { (y + h, y) } else { (y, y + h) };
+                        x0 < bx1 + TOL && x1 > bx0 - TOL && y0 < by1 + TOL && y1 > by0 - TOL
+                    };
+                    rects.retain(|r| overlaps(r.x, r.y, r.width, r.height));
+                    clipped_box = Some((bx0, by0, bx1, by1));
+                    lines.retain(|l| {
+                        overlaps(
+                            l.x1.min(l.x2),
+                            l.y1.min(l.y2),
+                            (l.x2 - l.x1).abs(),
+                            (l.y2 - l.y1).abs(),
+                        )
+                    });
                 }
             }
         }
@@ -552,8 +596,13 @@ fn extract_positioned_text_impl(
         all_rects.extend(rects);
         all_lines.extend(lines);
 
-        // Extract hyperlinks from page annotations
+        // Extract hyperlinks from page annotations. A turned page turns its
+        // annotation boxes too, so links stay on the text they cover and in
+        // the regions that text is assigned to.
         let mut links = extract_page_links(doc, page_id, *page_num);
+        for link in &mut links {
+            coords_rotated.rotate_box(&mut link.x, &mut link.y, &mut link.width, &mut link.height);
+        }
         // Annotations from the neighboring page are off-box too.
         if let Some((bx0, by0, bx1, by1)) = clipped_box {
             links.retain(|it| {
@@ -566,35 +615,44 @@ fn extract_positioned_text_impl(
             });
         }
         if frame == CoordinateFrame::VisiblePageBox {
-            // Annotation rects are raw user space even on pages whose text
-            // was rotation-normalized, so they take the unrotated shift.
-            frame_box.translate_items(&mut links, false);
+            // The link rects were turned with the page above, so they take
+            // the same turned shift as the page's items.
+            frame_box.translate_items(&mut links, coords_rotated);
         }
         all_items.extend(links);
     }
 
-    // Extract AcroForm field values
-    let mut form_items: Vec<TextItem> = extract_form_fields(doc, &page_id_to_num)
+    // Extract AcroForm field values. Widgets on a turned page turn with it,
+    // like links, so positional consumers keep them on the text they cover;
+    // in the visible-box frame they take the page's (turned) shift as well.
+    let form_items: Vec<TextItem> = extract_form_fields(doc, &page_id_to_num)
         .into_iter()
         .filter(|item| page_filter.is_none_or(|filter| filter.contains(&item.page)))
+        .map(|mut item| {
+            let rotation = page_rotations
+                .get(&item.page)
+                .copied()
+                .unwrap_or(geometry::PageRotation::Upright);
+            rotation.rotate_box(&mut item.x, &mut item.y, &mut item.width, &mut item.height);
+            if frame == CoordinateFrame::VisiblePageBox {
+                let frame_box = page_boxes.get(&item.page).copied().unwrap_or_else(|| {
+                    pages
+                        .get(&item.page)
+                        .and_then(|&id| visible_page_box(doc, id))
+                        .unwrap_or(PageBox::LETTER)
+                });
+                frame_box.translate_items(std::slice::from_mut(&mut item), rotation);
+            }
+            item
+        })
         .collect();
-    if frame == CoordinateFrame::VisiblePageBox {
-        for item in &mut form_items {
-            let frame_box = page_boxes.get(&item.page).copied().unwrap_or_else(|| {
-                pages
-                    .get(&item.page)
-                    .and_then(|&id| visible_page_box(doc, id))
-                    .unwrap_or(PageBox::LETTER)
-            });
-            frame_box.translate_items(std::slice::from_mut(item), false);
-        }
-    }
     all_items.extend(form_items);
 
     Ok((
         (all_items, all_rects, all_lines),
         page_thresholds,
         gid_encoded_pages,
+        page_rotations,
     ))
 }
 
@@ -761,9 +819,27 @@ pub(crate) fn multiply_matrices(m1: &[f32; 6], m2: &[f32; 6]) -> [f32; 6] {
 ///
 /// Only applies to non-CJK items whose text contains spaces (where Tw
 /// contributes) and whose average width-per-character is abnormally high.
+/// Extent used to detect overlapping (backtracking) paint order: the merge
+/// width for measured runs, the estimated box for width-less ones — an
+/// estimate is still evidence of where a fragment ends, and taking it as zero
+/// would let a tagged widthless ActualText line be x-sorted out of order.
+fn order_extent(item: &TextItem) -> f32 {
+    if item.advance_known {
+        effective_merge_width(item)
+    } else {
+        item.width
+    }
+}
+
 fn effective_merge_width(item: &TextItem) -> f32 {
     use crate::text_utils::is_cjk_char;
 
+    // An estimated box (font without widths) is the best extent there is for
+    // word-gap decisions — as it was when `effective_width` estimated it here;
+    // the Tw cap below only makes sense for measured widths.
+    if !item.advance_known {
+        return item.width;
+    }
     if item.width <= 0.0 || item.font_size <= 0.0 {
         return item.width;
     }
@@ -859,13 +935,13 @@ fn should_preserve_overlapping_stream_order(group: &[&TextItem]) -> bool {
     let mut sorted_by_x = group.to_vec();
     sorted_by_x.sort_by(|a, b| a.x.total_cmp(&b.x));
     let cluster_start = sorted_by_x[0].x;
-    let mut cluster_end = cluster_start + effective_merge_width(sorted_by_x[0]);
+    let mut cluster_end = cluster_start + order_extent(sorted_by_x[0]);
     for item in sorted_by_x.iter().skip(1) {
         let gap = item.x - cluster_end;
         if gap > max_font_size * 2.5 {
             return false;
         }
-        cluster_end = cluster_end.max(item.x + effective_merge_width(item));
+        cluster_end = cluster_end.max(item.x + order_extent(item));
     }
     if cluster_end - cluster_start > max_font_size * 36.0 {
         return false;
@@ -878,7 +954,7 @@ fn should_preserve_overlapping_stream_order(group: &[&TextItem]) -> bool {
         let backtrack_threshold = font_size * 0.25;
         let previous_start = previous.x;
         let next_start = next.x;
-        let next_end = next.x + effective_merge_width(next);
+        let next_end = next.x + order_extent(next);
         if next_start < previous_start - backtrack_threshold
             && next_end > previous_start + backtrack_threshold
         {
@@ -1183,6 +1259,8 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             let first = group[i];
             let mut text = first.text.clone();
             let mut end_x = first.x + effective_merge_width(first);
+            let mut box_right = first.x + first.width;
+            let mut box_left = first.x;
 
             // Tracked display text: run-local space floor overrides the
             // fixed thresholds for this run's junctions (see helper).
@@ -1218,6 +1296,20 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     || next.is_underline != first.is_underline
                     || next.is_strikeout != first.is_strikeout
                 {
+                    break;
+                }
+                // Merging walks along +x, which is only the reading direction
+                // of upright runs. A vertical stamp whose box bottom shares a
+                // baseline with a body line must not be glued onto it, two
+                // side-by-side vertical runs are separate lines, and the
+                // fragments of an upside-down run read towards -x, so an
+                // ascending walk would concatenate them reversed.
+                if !first.is_upright() || !next.is_upright() {
+                    break;
+                }
+                // A merged item carries one `advance_known`: never fold a
+                // measured run and an estimated one into the same item.
+                if next.advance_known != first.advance_known {
                     break;
                 }
                 let gap = next.x - end_x;
@@ -1277,6 +1369,8 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     text.push(' ');
                 }
                 text.push_str(&next.text);
+                box_right = box_right.max(next.x + next.width);
+                box_left = box_left.min(next.x);
                 let next_end = next.x + effective_merge_width(next);
                 end_x = if *preserve_stream_order {
                     end_x.max(next_end)
@@ -1288,9 +1382,19 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
 
             merged.push(TextItem {
                 text,
-                x: first.x,
+                // An estimated run's item is the union of the estimated boxes
+                // it merged, including any fragment that backtracked in x.
+                x: if first.advance_known {
+                    first.x
+                } else {
+                    box_left
+                },
                 y: first.y,
-                width: end_x - first.x,
+                width: if first.advance_known {
+                    end_x - first.x
+                } else {
+                    box_right - box_left
+                },
                 height: first.height,
                 font: first.font.clone(),
                 font_tag: first.font_tag.clone(),
@@ -1300,6 +1404,8 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                 is_italic: first.is_italic,
                 is_underline: first.is_underline,
                 is_strikeout: first.is_strikeout,
+                rotation: first.rotation,
+                advance_known: first.advance_known,
                 item_type: first.item_type.clone(),
                 mcid: first.mcid,
                 baseline_shift: 0.0,
@@ -1444,6 +1550,8 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
@@ -1681,6 +1789,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -1699,6 +1809,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -1717,6 +1829,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2505,6 +2619,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2523,6 +2639,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2541,6 +2659,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2570,6 +2690,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2588,6 +2710,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2606,6 +2730,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2637,6 +2763,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2675,6 +2803,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2714,6 +2844,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2732,6 +2864,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2750,6 +2884,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2776,6 +2912,8 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
@@ -2917,6 +3055,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2935,6 +3075,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2963,6 +3105,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -2981,6 +3125,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -3025,6 +3171,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -3073,6 +3221,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -3121,6 +3271,8 @@ mod tests {
                 is_italic: false,
                 is_underline: false,
                 is_strikeout: false,
+                rotation: 0.0,
+                advance_known: true,
                 item_type: ItemType::Text,
                 mcid: None,
                 baseline_shift: 0.0,
@@ -3162,6 +3314,8 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
@@ -3342,5 +3496,210 @@ mod tests {
             &make_item_fs("BC", 107.0, 500.0, 8.0, 4.0),
             0.0,
         ));
+    }
+
+    #[test]
+    fn vertical_run_never_merges_with_body_text_sharing_its_baseline() {
+        // A 12pt margin stamp whose box bottom lands on a body line's
+        // baseline, 2pt left of the body text: same y-group, tiny gap, same
+        // font — every merge criterion but orientation says "join". The same
+        // items set upright DO merge, so orientation is what blocks it.
+        let mut stamp = make_merge_item("arXiv:2301.00001", 12.0, 12.0);
+        stamp.height = 120.0;
+        stamp.rotation = 90.0;
+        let body = make_merge_item("Body text", 26.0, 54.0);
+
+        let merged = merge_text_items(vec![stamp.clone(), body.clone()]);
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert_eq!(merged[0].text, "arXiv:2301.00001");
+        assert_eq!(merged[1].text, "Body text");
+
+        stamp.height = 12.0;
+        stamp.rotation = 0.0;
+        stamp.width = 96.0;
+        let body_after_upright_stamp = make_merge_item("Body text", 110.0, 54.0);
+        let merged = merge_text_items(vec![stamp, body_after_upright_stamp]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].text, "arXiv:2301.00001 Body text");
+    }
+
+    #[test]
+    fn link_annotations_turn_with_a_rotated_page() {
+        use crate::tounicode::FontCMaps;
+        use lopdf::{dictionary, Object, Stream};
+
+        // Two 90° runs make the page rotated; the link annotation covering
+        // the first one (page box x 188..200, y 100..140) must land in the
+        // same turned frame as the text: x = old y, y = -(old right edge).
+        let mut doc = lopdf::Document::new();
+        let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "FirstChar" => 0,
+            "LastChar" => 255,
+            "Widths" => Object::Array(widths),
+        });
+        let content_id = doc.add_object(Object::Stream(Stream::new(
+            dictionary! {},
+            b"BT /F1 12 Tf 0 1 -1 0 200 100 Tm (HELLO) Tj ET
+BT /F1 12 Tf 0 1 -1 0 240 100 Tm (WORLD) Tj ET"
+                .to_vec(),
+        )));
+        let link_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Link",
+            "Rect" => vec![188.into(), 100.into(), 200.into(), 140.into()],
+            "A" => dictionary! {
+                "S" => "URI",
+                "URI" => Object::string_literal("https://example.com/"),
+            },
+        });
+        // An AcroForm text field drawn over the second run (page box
+        // x 228..240, y 100..150) must turn the same way.
+        let widget_id = doc.add_object(dictionary! {
+            "Type" => "Annot",
+            "Subtype" => "Widget",
+            "FT" => "Tx",
+            "T" => Object::string_literal("field"),
+            "V" => Object::string_literal("value"),
+            "Rect" => vec![228.into(), 100.into(), 240.into(), 150.into()],
+        });
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Contents" => Object::Reference(content_id),
+            "Annots" => vec![Object::Reference(link_id), Object::Reference(widget_id)],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => Object::Reference(font_id) },
+            },
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        });
+        let pages_id = doc.add_object(dictionary! {
+            "Type" => "Pages",
+            "Count" => Object::Integer(1),
+            "Kids" => vec![Object::Reference(page_id)],
+        });
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => Object::Reference(pages_id),
+            "AcroForm" => dictionary! {
+                "Fields" => vec![Object::Reference(widget_id)],
+            },
+        });
+        doc.trailer.set("Root", Object::Reference(catalog_id));
+
+        let font_cmaps = FontCMaps::from_doc(&doc);
+        let ((items, _, _), _, _, page_rotations) =
+            extract_positioned_text_from_doc(&doc, &font_cmaps, None).unwrap();
+        assert_eq!(page_rotations.get(&1), Some(&geometry::PageRotation::Ccw));
+        let field = items
+            .iter()
+            .find(|i| matches!(i.item_type, ItemType::FormField))
+            .expect("form field item");
+        assert_eq!(
+            (field.x, field.y, field.width, field.height),
+            (100.0, -240.0, 50.0, 12.0)
+        );
+        let hello = items.iter().find(|i| i.text == "HELLO").unwrap();
+        assert_eq!(hello.rotation, 0.0);
+        assert!((hello.x - 100.0).abs() < 0.01 && (hello.y + 200.0).abs() < 0.01);
+        let link = items
+            .iter()
+            .find(|i| matches!(i.item_type, ItemType::Link(_)))
+            .expect("link item");
+        assert_eq!(
+            (link.x, link.y, link.width, link.height),
+            (100.0, -200.0, 40.0, 12.0)
+        );
+        assert_eq!(link.rotation, 0.0);
+    }
+
+    #[test]
+    fn upside_down_fragments_are_never_concatenated_reversed() {
+        // A 180° run shown as two operators: "HELLO" is painted first, at
+        // the right, and "WORLD" continues towards -x. Walking x ascending
+        // would merge them as "WORLD HELLO"; they must stay separate.
+        let mut hello = make_merge_item("HELLO", 310.0, 50.0);
+        hello.rotation = 180.0;
+        let mut world = make_merge_item("WORLD", 258.0, 50.0);
+        world.rotation = 180.0;
+        let merged = merge_text_items(vec![hello, world]);
+        assert_eq!(merged.len(), 2, "{merged:?}");
+        assert!(merged.iter().any(|i| i.text == "HELLO"));
+        assert!(merged.iter().any(|i| i.text == "WORLD"));
+    }
+
+    #[test]
+    fn measured_and_estimated_runs_never_merge() {
+        // A width-less font's run (estimated box) next to a measured one on
+        // the same baseline: the pair must stay two items, whichever comes
+        // first, so `advance_known` keeps describing each item truthfully.
+        let measured = make_merge_item("known", 100.0, 30.0);
+        let mut estimated = make_merge_item("guess", 132.0, 30.0);
+        estimated.advance_known = false;
+        assert_eq!(
+            merge_text_items(vec![measured.clone(), estimated.clone()]).len(),
+            2
+        );
+        assert_eq!(merge_text_items(vec![estimated, measured]).len(), 2);
+    }
+
+    #[test]
+    fn merged_estimated_runs_keep_the_union_of_their_boxes() {
+        // Two width-less runs positioned at their estimated advance (half an
+        // em per glyph at 12pt) walk like measured ones — gap 0, no space —
+        // and the merged item is the union of the two estimated boxes.
+        let mut first = make_merge_item("ab", 100.0, 12.0);
+        first.advance_known = false;
+        let mut second = make_merge_item("cdefg", 112.0, 30.0);
+        second.advance_known = false;
+        let merged = merge_text_items(vec![first, second]);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert_eq!(merged[0].text, "abcdefg");
+        assert!(!merged[0].advance_known);
+        assert!((merged[0].x - 100.0).abs() < 1e-3, "x = {}", merged[0].x);
+        assert!(
+            (merged[0].width - 42.0).abs() < 1e-3,
+            "width = {}",
+            merged[0].width
+        );
+    }
+
+    #[test]
+    fn estimated_fragments_that_backtrack_keep_the_union_box() {
+        // Stream order "abc" (x 100), "de" (x 94, a backtrack), "fg" (x 118):
+        // whichever order the merge walks, the estimated item spans from the
+        // leftmost fragment to the rightmost box edge.
+        let mut a = make_merge_item("abc", 100.0, 18.0);
+        let mut b = make_merge_item("de", 94.0, 10.0);
+        let mut c = make_merge_item("fg", 118.0, 12.0);
+        for item in [&mut a, &mut b, &mut c] {
+            item.advance_known = false;
+            item.mcid = Some(1);
+        }
+        let merged = merge_text_items(vec![a, b, c]);
+        assert_eq!(merged.len(), 1, "{merged:?}");
+        assert!(!merged[0].advance_known);
+        assert!((merged[0].x - 94.0).abs() < 1e-3, "x = {}", merged[0].x);
+        assert!(
+            (merged[0].width - 36.0).abs() < 1e-3,
+            "width = {}",
+            merged[0].width
+        );
+    }
+
+    #[test]
+    fn side_by_side_vertical_runs_stay_separate_lines() {
+        // Two lines of a vertical stamp are adjacent em columns with the
+        // same bottom: walking x would glue them into one "line".
+        let mut first = make_merge_item("line one", 12.0, 12.0);
+        first.height = 80.0;
+        first.rotation = 90.0;
+        let mut second = make_merge_item("line two", 24.0, 12.0);
+        second.height = 80.0;
+        second.rotation = 90.0;
+        let merged = merge_text_items(vec![first, second]);
+        assert_eq!(merged.len(), 2, "{merged:?}");
     }
 }

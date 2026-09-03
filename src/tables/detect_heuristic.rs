@@ -70,6 +70,7 @@ fn merge_adjacent_items_preserving(
             let (first_idx, first_item) = group[i];
             let mut text = first_item.text.clone();
             let mut end_x = first_item.x + first_item.width;
+            let mut box_right = first_item.x + first_item.width;
             let mut indices = vec![first_idx];
             let x_gap_max = first_item.font_size * 0.5;
 
@@ -80,6 +81,16 @@ fn merge_adjacent_items_preserving(
                 // Must be similar font size (within 20%)
                 if (next_item.font_size - first_item.font_size).abs() > first_item.font_size * 0.20
                 {
+                    break;
+                }
+
+                // Merging walks +x in reading order: a rotated table header
+                // (or an upside-down run) never joins a neighbouring cell,
+                // matching `merge_text_items`.
+                if !first_item.is_upright() || !next_item.is_upright() {
+                    break;
+                }
+                if first_item.advance_known != next_item.advance_known {
                     break;
                 }
 
@@ -117,6 +128,7 @@ fn merge_adjacent_items_preserving(
                 }
                 text.push_str(&next_item.text);
                 end_x = next_item.x + next_item.width;
+                box_right = box_right.max(next_item.x + next_item.width);
                 indices.push(next_idx);
                 j += 1;
             }
@@ -125,7 +137,11 @@ fn merge_adjacent_items_preserving(
                 text,
                 x: first_item.x,
                 y: first_item.y,
-                width: end_x - first_item.x,
+                width: if first_item.advance_known {
+                    end_x - first_item.x
+                } else {
+                    box_right - first_item.x
+                },
                 height: first_item.height,
                 font: first_item.font.clone(),
                 font_tag: first_item.font_tag.clone(),
@@ -135,6 +151,8 @@ fn merge_adjacent_items_preserving(
                 is_italic: first_item.is_italic,
                 is_underline: first_item.is_underline,
                 is_strikeout: first_item.is_strikeout,
+                rotation: first_item.rotation,
+                advance_known: first_item.advance_known,
                 item_type: first_item.item_type.clone(),
                 mcid: first_item.mcid,
                 // A consolidated run keeps its script flag only when every
@@ -1016,6 +1034,9 @@ fn detect_table_in_region(
     for (idx, item) in items {
         let col = find_column_index(&columns, item.x);
         let row = find_row_index(&rows, item.line_y());
+        if super::crosses_other_rows(item, &rows, row) {
+            continue;
+        }
 
         if let (Some(col), Some(row)) = (col, row) {
             cell_items[row][col].push(item);
@@ -2253,6 +2274,8 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
@@ -2397,6 +2420,8 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: strikeout,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,

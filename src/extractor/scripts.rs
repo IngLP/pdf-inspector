@@ -484,6 +484,8 @@ mod tests {
 
     fn make_item_fs(text: &str, x: f32, y: f32, width: f32, font_size: f32) -> TextItem {
         TextItem {
+            rotation: 0.0,
+            advance_known: true,
             text: text.into(),
             x,
             y,

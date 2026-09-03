@@ -11,6 +11,7 @@
 
 use lopdf::{Document, Object, ObjectId};
 
+use super::geometry::PageRotation;
 use crate::types::{PdfLine, PdfRect, TextItem};
 
 /// The visible page box in raw PDF user space, normalized so `x0 < x1` and
@@ -67,18 +68,15 @@ impl PageBox {
     /// Offset that moves raw user-space geometry into the visible-box frame,
     /// where the box's lower-left corner is the origin.
     ///
-    /// Pages flagged `coords_rotated` were normalized by
-    /// `content_stream::correct_rotated_page`, which maps `(x, y)` to
-    /// `(y, -x)`. Translating before that rotation is the same as applying
-    /// the rotated offset `(-y0, +x0)` afterwards, so the items, rects and
-    /// lines it produced stay consistent with region bounds computed from
-    /// the visible box height.
-    fn shift(&self, coords_rotated: bool) -> (f32, f32) {
-        if coords_rotated {
-            (-self.y0, self.x0)
-        } else {
-            (-self.x0, -self.y0)
-        }
+    /// A page whose frame was turned by `content_stream::correct_rotated_page`
+    /// (see [`PageRotation`]) had its points mapped `(x, y) → (y, -x)` or
+    /// `(x, y) → (-y, x)`. Translating before that turn is the same as
+    /// applying the turned offset afterwards — `(-y0, +x0)` for a
+    /// counter-clockwise turn, `(+y0, -x0)` for a clockwise one — so the
+    /// items, rects and lines it produced stay consistent with region bounds
+    /// computed from the visible box height.
+    fn shift(&self, rotation: PageRotation) -> (f32, f32) {
+        rotation.rotate_point(-self.x0, -self.y0)
     }
 
     /// Shift one page's items, rects and lines into the visible-box frame.
@@ -87,9 +85,9 @@ impl PageBox {
         items: &mut [TextItem],
         rects: &mut [PdfRect],
         lines: &mut [PdfLine],
-        coords_rotated: bool,
+        rotation: PageRotation,
     ) {
-        let (dx, dy) = self.shift(coords_rotated);
+        let (dx, dy) = self.shift(rotation);
         if dx == 0.0 && dy == 0.0 {
             return;
         }
@@ -110,8 +108,8 @@ impl PageBox {
     }
 
     /// Shift items alone into the visible-box frame.
-    pub(crate) fn translate_items(&self, items: &mut [TextItem], coords_rotated: bool) {
-        self.translate_page(items, &mut [], &mut [], coords_rotated);
+    pub(crate) fn translate_items(&self, items: &mut [TextItem], rotation: PageRotation) {
+        self.translate_page(items, &mut [], &mut [], rotation);
     }
 }
 
@@ -391,6 +389,8 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
+            rotation: 0.0,
+            advance_known: true,
         }
     }
 
@@ -412,7 +412,7 @@ mod tests {
             y2: 70.0,
             page: 1,
         }];
-        page_box.translate_page(&mut items, &mut rects, &mut lines, false);
+        page_box.translate_page(&mut items, &mut rects, &mut lines, PageRotation::Upright);
         assert_eq!((items[0].x, items[0].y), (70.0, 240.0));
         assert_eq!((rects[0].x, rects[0].y), (50.0, 140.0));
         assert_eq!((rects[0].width, rects[0].height), (30.0, 5.0));
@@ -424,21 +424,26 @@ mod tests {
 
     #[test]
     fn rotated_translation_matches_translating_before_rotation() {
-        // correct_rotated_page maps (x, y) -> (y, -x). Shifting the raw
-        // point first and rotating must equal rotating first and applying
-        // the rotated shift.
+        // Shifting the raw point first and turning must equal turning first
+        // and applying the turned shift, for both turns: counter-clockwise
+        // maps (x, y) -> (y, -x), clockwise maps (x, y) -> (-y, x).
         let page_box = page_box(50.0, 60.0, 350.0, 460.0);
         let (raw_x, raw_y) = (120.0_f32, 300.0_f32);
-        let expected = (raw_y - page_box.y0, -(raw_x - page_box.x0));
+        let (rel_x, rel_y) = (raw_x - page_box.x0, raw_y - page_box.y0);
+
         let mut items = vec![item(raw_y, -raw_x)];
-        page_box.translate_items(&mut items, true);
-        assert_eq!((items[0].x, items[0].y), expected);
+        page_box.translate_items(&mut items, PageRotation::Ccw);
+        assert_eq!((items[0].x, items[0].y), (rel_y, -rel_x));
+
+        let mut items = vec![item(-raw_y, raw_x)];
+        page_box.translate_items(&mut items, PageRotation::Cw);
+        assert_eq!((items[0].x, items[0].y), (-rel_y, rel_x));
     }
 
     #[test]
     fn origin_box_is_a_no_op() {
         let mut items = vec![item(72.0, 700.0)];
-        PageBox::LETTER.translate_items(&mut items, false);
+        PageBox::LETTER.translate_items(&mut items, PageRotation::Upright);
         assert_eq!((items[0].x, items[0].y), (72.0, 700.0));
     }
 }

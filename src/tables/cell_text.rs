@@ -239,6 +239,8 @@ mod tests {
 
     fn make_item(text: &str, x: f32, y: f32, font_size: f32) -> TextItem {
         TextItem {
+            rotation: 0.0,
+            advance_known: true,
             text: text.to_string(),
             x,
             y,
@@ -308,6 +310,8 @@ mod tests {
 
     fn cell(text: &str, x: f32, width: f32, y: f32, font_size: f32, shift: f32) -> TextItem {
         TextItem {
+            rotation: 0.0,
+            advance_known: true,
             text: text.into(),
             x,
             y,

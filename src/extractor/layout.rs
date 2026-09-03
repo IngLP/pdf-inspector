@@ -511,7 +511,7 @@ impl ProseLineStats {
         let line_y = line_items[0].line_y();
         let line_height = line_items
             .iter()
-            .map(|i| i.height)
+            .map(|i| i.cross_extent())
             .fold(0.0_f32, f32::max)
             .max(1.0);
         if let Some(previous_y) = self.previous_line_y {
@@ -2633,7 +2633,9 @@ fn split_into_y_bands(detection_items: &[TextItem]) -> (Vec<YBand>, Vec<(f32, f3
     let mut intervals: Vec<(f32, f32)> = text_items
         .iter()
         .filter(|i| effective_width(i) <= wide_threshold)
-        .map(|i| (i.y + i.height.max(0.0), i.y))
+        // Em box, not `height`: a vertical run's height is its advance and
+        // would fill the very gap its neighbours' whitespace should expose.
+        .map(|i| (i.y + i.cross_extent().max(0.0), i.y))
         .filter(|(top, bottom)| top.is_finite() && bottom.is_finite())
         .collect();
     if intervals.len() < 10 {
@@ -3076,6 +3078,8 @@ mod tests {
             is_italic: false,
             is_underline: false,
             is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
             item_type: ItemType::Text,
             mcid: None,
             baseline_shift: 0.0,
@@ -3825,6 +3829,8 @@ mod tests {
                     is_italic: false,
                     is_underline: false,
                     is_strikeout: false,
+                    rotation: 0.0,
+                    advance_known: true,
                     item_type: ItemType::Text,
                     mcid: None,
                     baseline_shift: 0.0,

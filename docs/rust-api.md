@@ -525,7 +525,9 @@ synthetic landscape frame before the shift, and `/Rotate` is not applied.
 | `detect_pdf_mem(bytes)` | Fast detection from a byte buffer |
 | `process_pdf_mem_with_options(bytes, options)` | Process from bytes with custom options |
 | `extract_text(path)` | Plain text extraction |
-| `extract_text_with_positions(path)` | Text with X/Y coordinates (visible-page-box frame, see above) and font info |
+| `extract_text_with_positions(path)` | Text with its axis-aligned box (visible-page-box frame, see above), `rotation`, and font info |
+| `extract_text_with_positions_and_rotations_mem(bytes)` | Positioned text plus the `PageRotation` of every page whose text was predominantly rotated |
+| `collect_text_in_region_in_frame(items, x1, y1, x2, y2, page_height, rotation)` | Region text with the page's coordinate frame given explicitly (`page_height` is the visible page box height) |
 | `to_markdown(text, options)` | Convert plain text to Markdown |
 | `to_markdown_from_items(items, options)` | Markdown from pre-extracted `TextItem`s |
 | `to_markdown_from_items_with_rects(items, options, rects)` | Markdown with rectangle-based table detection |
@@ -548,7 +550,8 @@ Low-level detection functions are also available via the `detector` module (`det
 | `DetectionConfig` | Configuration for detection: scan strategy, thresholds |
 | `ScanStrategy` | `EarlyExit`, `Full`, `Sample(n)`, `Pages(vec)` |
 | `LayoutComplexity` | Layout analysis: is_complex, pages_with_tables, pages_with_columns |
-| `TextItem` | Text with position (PDF points from the visible page box's lower-left corner), font info, page number, optional structure-tree `mcid`, and `baseline_shift` (non-zero for super/subscript glyph runs; `line_y()` gives the body baseline) |
+| `TextItem` | Text with its axis-aligned box (PDF points from the visible page box's lower-left corner), baseline `rotation` in degrees (a vertical run is tall and thin, never zero-width), `advance_known` (false when the font has no width metrics or an ActualText span's advance could not be recovered), `baseline_shift` (non-zero for super/subscript glyph runs; `line_y()` gives the body baseline), font info, page number, and optional structure-tree `mcid` |
+| `PageRotation` | `Upright`, `Ccw`, `Cw`: how a predominantly rotated page's coordinate frame was turned so its text reads left-to-right |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
 | `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
