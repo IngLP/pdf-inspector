@@ -1285,7 +1285,6 @@ pub fn extract_tables_in_regions_mem(
 
     let needed_pages: HashSet<u32> = page_regions.iter().map(|(p, _)| p + 1).collect();
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
-    let page_bounds = extractor::page_vertical_bounds(&doc);
 
     let mut items_by_page: HashMap<u32, Vec<TextItem>> = HashMap::new();
     let mut rects_by_page: HashMap<u32, Vec<PdfRect>> = HashMap::new();
@@ -1332,6 +1331,19 @@ pub fn extract_tables_in_regions_mem(
         rects_by_page.insert(*page_num, rects);
         lines_by_page.insert(*page_num, lines);
     }
+
+    // Folio bands for the column-table builder, expressed in the frame its
+    // items are already in. `extract_page_text_items_in_page_box` shifted
+    // every item so that the visible box's lower-left corner is the origin,
+    // so a page's extent is `0..height` here — not the raw user-space
+    // `(y0, y1)` that `extractor::page_vertical_bounds` reports for the
+    // markdown pipeline, which never leaves user space. Handing the raw pair
+    // to this path would put the top band a full `y0` above the items on any
+    // page whose box origin is not at zero.
+    let page_bounds: extractor::PageVerticalBounds = page_heights
+        .iter()
+        .map(|(page, height)| (*page, (0.0, *height)))
+        .collect();
 
     let mut results = Vec::with_capacity(page_regions.len());
 
