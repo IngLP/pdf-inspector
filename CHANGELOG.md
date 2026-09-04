@@ -11,6 +11,43 @@ version and date. Earlier releases are described in their
 
 ### Added
 
+- Hyperlink annotations reach the Markdown. A `/Link /URI` rectangle is
+  matched to the text it decorates and that text becomes the anchor:
+  `Fonte: [Statista, 2024](https://statista.com/...)`. A span is claimed when
+  at least half its own height falls inside the rectangle, and only the part
+  of it the rectangle covers is anchored, so a producer that merges a whole
+  source line into one run ("Fonte: Linkedin. Jordan Blake. Medium.") and
+  hangs a separate annotation on each name still gets three correct anchors.
+  Anchors inside a detected table's cells are wrapped too. A rectangle whose
+  claim on a span is punctuation alone (`[.](mailto:…)`, the comma between two
+  linked names) anchors nothing. Text that spells its destination *in full* is
+  left alone for `format_urls` — but only while `format_urls` is on, and only
+  when it really is the whole destination: a URL the producer broke over two
+  lines and hung one annotation on each half is anchored, so the destination
+  survives instead of `format_urls` linkifying a URL truncated at the break.
+  `format_urls` no longer linkifies inside a destination a `<` has opened —
+  the `<https://…>` autolink of the page list, and the `](<https://…>)` form a
+  destination carrying a parenthesis or a space takes.
+- Only `http`, `https`, `mailto` and `tel` destinations are written into the
+  Markdown. `javascript:void(0)` on a reference that expands in place and a
+  bare `#` on a dead in-document jump are viewer gestures, not places a reader
+  of the Markdown can go; the words under such a rectangle are emitted
+  unwrapped, and the annotation is still reported in full — the raw URI in
+  `MarkdownLink::url`, the words in `anchor`, with `anchored_inline` false.
+- A link whose rectangle covers no text — a clickable logo, a social icon, a
+  bitmap chart — is listed at the foot of its page under
+  `**Links on this page**` as `- <url>`, with the image under it named when
+  there is one, so no destination is dropped. The list carries destinations,
+  not annotations: a URL another rectangle on the page already anchors, and a
+  second rectangle on a URL the list already names, add no entry.
+- `PageMarkdown::links` (Python `PageMarkdown.links`, a list of
+  `MarkdownLink` with `url`, `rect`, `page`, `anchor` and `anchored_inline`)
+  reports every annotation of a page and what became of it, so a consumer
+  never has to parse the Markdown back. Reported for pages routed to OCR too,
+  whose annotations are exact file data. `anchored_inline` is `true` when a
+  rendered line or table cell carried the anchor; `false` says only that none
+  did, and `anchor` is often set alongside it.
+
 - `TextItem::baseline_shift`: signed offset, in points, of a superscript or
   subscript glyph run from the baseline of the body text it is attached to
   (positive = raised, negative = lowered, `0` for normal text). Exposed as
@@ -76,6 +113,12 @@ version and date. Earlier releases are described in their
   that builds a `TextItem` with a struct literal must add it (`0.0` for normal
   text). This follows the precedent of `font_tag` in 1.16.0; the Python and
   Node bindings are unaffected.
+- Rust: `PageMarkdown` gained the required public field `links`, so code that
+  builds a `PageMarkdown` with a struct literal must add it (`Vec::new()` for
+  a page with no annotations, or when `MarkdownOptions::include_links` is
+  off). Reading a `PageMarkdown` the library returned is unaffected, as are
+  the Python and Node bindings. Same precedent as `TextItem` above: the struct
+  stays constructible rather than becoming `#[non_exhaustive]`.
 - Snapshot fixtures `thermo-freon12` and `shannon-entropy-p1-2` updated for
   the corrected script handling (`Freon<sup>®</sup>`, `V<sub>f</sub>`,
   `2<sup>N</sup>`, `¹Nyquist`, `log<sub>b</sub> a`).

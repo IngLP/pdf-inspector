@@ -8,9 +8,9 @@ use pdf_inspector::{
     detect_pdf_type, detect_vector_grid_in_region_mem, extract_pages_markdown,
     extract_pages_markdown_mem, extract_tables_in_regions_mem, extract_text,
     extract_text_in_regions_mem, extract_text_with_positions, extract_text_with_positions_mem,
-    process_pdf_mem, process_pdf_mem_with_options, process_pdf_with_options, to_markdown,
-    to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, PdfError, PdfOptions,
-    PdfType, TextItem,
+    extract_text_with_positions_pages, process_pdf_mem, process_pdf_mem_with_options,
+    process_pdf_with_options, to_markdown, to_markdown_from_items_with_rects_and_page_count,
+    MarkdownOptions, PdfError, PdfOptions, PdfType, TextItem,
 };
 use std::collections::HashSet;
 
@@ -4968,4 +4968,525 @@ fn test_region_table_apis_use_visible_box_frame() {
             region.text
         );
     }
+}
+
+/// A one-page PDF exercising the three shapes a `/Link /URI` annotation takes:
+/// a rectangle over part of a text line, a rectangle over an image with no
+/// text under it, and a rectangle over text that already spells its own URL.
+///
+/// Built here rather than checked in as a fixture because every byte of it is
+/// load-bearing for the anchoring geometry: the rectangles are placed against
+/// the text's own advance widths, which a binary fixture would hide.
+fn make_linked_page_pdf() -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    fn add_object(pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, id: usize, body: &str) {
+        offsets.push(pdf.len());
+        pdf.extend_from_slice(format!("{id} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(body.as_bytes());
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        1,
+        "<< /Type /Catalog /Pages 2 0 R >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        2,
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        3,
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+         /Resources << /Font << /F1 5 0 R >> /XObject << /Im0 6 0 R >> >> \
+         /Contents 4 0 R /Annots [7 0 R 8 0 R 9 0 R 10 0 R] >>",
+    );
+
+    // 12pt Helvetica. "Fonte: " is 7 characters wide; the anchor "Statista"
+    // follows it, and the bare URL sits on its own line.
+    let mut content = String::from("BT /F1 12 Tf 1 0 0 1 72 700 Tm (Fonte: Statista, 2024) Tj ");
+    content.push_str("1 0 0 1 72 660 Tm (https://example.com/shop) Tj ");
+    // Enough body text that detection reads the page as text-based rather
+    // than as a scan wrapped around the image placeholder.
+    for (index, y) in (0..12).map(|i| (i, 620 - i * 16)) {
+        content.push_str(&format!(
+            "1 0 0 1 72 {y} Tm (Body line {index} of the report, with ordinary prose on it.) Tj "
+        ));
+    }
+    content.push_str("ET\nq 120 0 0 80 72 300 cm /Im0 Do Q");
+    let content = content.as_str();
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        4,
+        &format!(
+            "<< /Length {} >>\nstream\n{}\nendstream",
+            content.len(),
+            content
+        ),
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        5,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        6,
+        "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceGray \
+         /BitsPerComponent 8 /Length 1 >>\nstream\n\u{0}\nendstream",
+    );
+
+    // "Fonte: " ends at 72 + 7 * 12 * 0.5 = 114; "Statista, 2024" runs to
+    // about 72 + 21 * 6 = 198. The rectangle is drawn generously around the
+    // line, as a producer draws it.
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        7,
+        "<< /Type /Annot /Subtype /Link /Rect [112 694 200 714] /Border [0 0 0] \
+         /A << /S /URI /URI (https://statista.com/report) >> >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        8,
+        "<< /Type /Annot /Subtype /Link /Rect [72 300 192 380] /Border [0 0 0] \
+         /A << /S /URI /URI (https://example.com/logo-target) >> >>",
+    );
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        9,
+        "<< /Type /Annot /Subtype /Link /Rect [70 654 240 674] /Border [0 0 0] \
+         /A << /S /URI /URI (https://example.com/shop) >> >>",
+    );
+
+    // A reference the viewer expands in place: a rectangle over real words
+    // whose destination is a script, not a place.
+    add_object(
+        &mut pdf,
+        &mut offsets,
+        10,
+        "<< /Type /Annot /Subtype /Link /Rect [70 614 300 634] /Border [0 0 0] \
+         /A << /S /URI /URI (javascript:void\\(0\\)) >> >>",
+    );
+
+    let xref_start = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for offset in offsets.iter().skip(1) {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF",
+            offsets.len(),
+            xref_start
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn link_over_text_becomes_an_inline_markdown_anchor() {
+    let buf = make_linked_page_pdf();
+    let markdown = process_pdf_mem(&buf).unwrap().markdown.expect("markdown");
+
+    assert!(
+        markdown.contains("Fonte: [Statista, 2024](https://statista.com/report)"),
+        "expected the words under the rectangle to be the anchor, got:\n{markdown}"
+    );
+}
+
+#[test]
+fn link_over_an_image_is_listed_at_the_foot_of_its_page() {
+    let buf = make_linked_page_pdf();
+    let markdown = process_pdf_mem(&buf).unwrap().markdown.expect("markdown");
+
+    assert!(
+        markdown.contains("**Links on this page**"),
+        "expected a link list, got:\n{markdown}"
+    );
+    assert!(
+        markdown.contains("- <https://example.com/logo-target> on ![Image: Im0](image)"),
+        "expected the image link listed with its image, got:\n{markdown}"
+    );
+}
+
+#[test]
+fn link_whose_text_is_its_own_url_is_not_linked_twice() {
+    let buf = make_linked_page_pdf();
+    let markdown = process_pdf_mem(&buf).unwrap().markdown.expect("markdown");
+
+    assert!(
+        markdown.contains("[https://example.com/shop](https://example.com/shop)"),
+        "expected one plain link for the visible URL, got:\n{markdown}"
+    );
+    assert!(
+        !markdown.contains("[[https://example.com/shop]"),
+        "expected no nested link, got:\n{markdown}"
+    );
+    assert_eq!(
+        markdown.matches("https://example.com/shop").count(),
+        2,
+        "expected exactly the anchor and the destination, got:\n{markdown}"
+    );
+}
+
+#[test]
+fn page_markdown_reports_every_link_annotation() {
+    let buf = make_linked_page_pdf();
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap().pages;
+
+    let links = &pages[0].links;
+    assert_eq!(links.len(), 4);
+
+    let statista = links
+        .iter()
+        .find(|link| link.url == "https://statista.com/report")
+        .expect("statista link");
+    assert_eq!(statista.page, 1);
+    assert_eq!(statista.rect, (112.0, 694.0, 88.0, 20.0));
+    assert_eq!(statista.anchor.as_deref(), Some("Statista, 2024"));
+    assert!(statista.anchored_inline);
+
+    let logo = links
+        .iter()
+        .find(|link| link.url == "https://example.com/logo-target")
+        .expect("logo link");
+    assert_eq!(logo.anchor, None);
+    assert!(!logo.anchored_inline);
+
+    // The one shape `anchored_inline` is documented to allow and the rest of
+    // this page does not show: the rectangle covers words, the record says
+    // which, and no link was emitted for them because the Markdown does not
+    // write a `javascript:` destination.
+    let scripted = links
+        .iter()
+        .find(|link| link.url == "javascript:void(0)")
+        .expect("scripted link");
+    assert_eq!(
+        scripted.anchor.as_deref(),
+        Some("Body line 0 of the report, with ordinary prose")
+    );
+    assert!(!scripted.anchored_inline);
+
+    let markdown = process_pdf_mem(&buf).unwrap().markdown.expect("markdown");
+    assert!(
+        markdown.contains("Body line 0 of the report, with ordinary prose on it."),
+        "the words stay, unwrapped, got:\n{markdown}"
+    );
+    assert!(!markdown.contains("javascript:"), "got:\n{markdown}");
+}
+
+#[test]
+fn every_link_annotation_of_a_real_fixture_reaches_the_markdown() {
+    // 41 `/Link /URI` annotations over 24 distinct URLs, laid over a page
+    // whose text is deliberately mis-encoded: whatever the anchor text turns
+    // out to be, no destination may be dropped, and none may come out linked
+    // twice.
+    let buf = std::fs::read("tests/fixtures/shifted_cipher_tounicode.pdf").unwrap();
+    let pages = extract_pages_markdown_mem(&buf, None).unwrap().pages;
+    let links: Vec<_> = pages.iter().flat_map(|page| page.links.iter()).collect();
+    assert_eq!(links.len(), 41, "expected every annotation to be reported");
+
+    let markdown = process_pdf_mem(&buf).unwrap().markdown.expect("markdown");
+    for link in &links {
+        assert!(
+            markdown.contains(&link.url),
+            "destination {} is missing from the markdown",
+            link.url
+        );
+    }
+    // The page's text is untrusted, so the per-page API reports the
+    // annotations without anchors; the document conversion still anchors
+    // them, and that is what the Markdown must show.
+    assert!(links.iter().all(|link| link.anchor.is_none()));
+    let mut destinations: Vec<&str> = links.iter().map(|link| link.url.as_str()).collect();
+    destinations.sort_unstable();
+    destinations.dedup();
+    assert_eq!(destinations.len(), 24, "distinct destinations");
+
+    let anchored: Vec<&&str> = destinations
+        .iter()
+        .filter(|url| markdown.contains(&format!("]({url})")))
+        .collect();
+    assert_eq!(
+        anchored.len(),
+        destinations.len(),
+        "every distinct destination must be an inline link target; missing: {:?}",
+        destinations
+            .iter()
+            .filter(|url| !markdown.contains(&format!("]({url})")))
+            .collect::<Vec<_>>()
+    );
+    // One anchor written out in full, so a regression in the clipping shows
+    // up as a wrong anchor and not only as a missing link.
+    assert!(
+        markdown.contains(
+            "[:iYZSZe.'TeYVaVcZUVUZX9VTVSVc-&,*](https://www.sec.gov/Archives/edgar/\
+             data/732717/000073271712000025/ex4c.htm)"
+        ),
+        "expected the clipped anchor of the ex4c link, got:\n{}",
+        &markdown[..markdown.len().min(4000)]
+    );
+    assert!(
+        !markdown.contains("]([https://"),
+        "a destination was linked a second time"
+    );
+    assert!(
+        !markdown.contains("<[https://"),
+        "an autolink was linked a second time"
+    );
+}
+
+/// Convert only `pages` (1-indexed) of `path` to Markdown.
+///
+/// Both link fixtures are hundreds of pages long, and a document-wide
+/// conversion of either costs minutes in a debug build. The defects these
+/// tests pin are per-page, so each names the pages that carry it.
+fn markdown_of_pages(path: &str, pages: &[u32]) -> String {
+    let buf = std::fs::read(path).unwrap();
+    let options = PdfOptions {
+        page_filter: Some(pages.iter().copied().collect()),
+        ..PdfOptions::new()
+    };
+    process_pdf_mem_with_options(&buf, options)
+        .unwrap()
+        .markdown
+        .expect("markdown")
+}
+
+/// Every `[anchor](destination)` of `markdown`, with the angle brackets of a
+/// wrapped destination stripped and image placeholders left out.
+/// Deliberately simple: the emitter never nests one link inside another.
+fn inline_links(markdown: &str) -> Vec<(String, String)> {
+    let mut links = Vec::new();
+    let mut rest = markdown;
+    while let Some(open) = rest.find('[') {
+        rest = &rest[open + 1..];
+        let Some(close) = rest.find("](") else { break };
+        let anchor = &rest[..close];
+        if anchor.contains('[') {
+            continue;
+        }
+        let tail = &rest[close + 2..];
+        let Some(end) = tail.find(')') else { break };
+        let destination = match tail.strip_prefix('<').map(|open| open.find('>')) {
+            Some(Some(closing)) => &tail[1..closing + 1],
+            _ => &tail[..end],
+        };
+        if !anchor.starts_with("Image: ") {
+            links.push((anchor.to_string(), destination.to_string()));
+        }
+        rest = tail;
+    }
+    links
+}
+
+/// The destinations listed under a `**Links on this page**` heading.
+fn listed_destinations(markdown: &str) -> Vec<&str> {
+    markdown
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- <"))
+        .filter_map(|entry| entry.split('>').next())
+        .collect()
+}
+
+#[test]
+fn a_destination_survives_with_url_formatting_turned_off() {
+    // The annotation over the bare URL is left undecorated only because
+    // `format_urls` linkifies that URL itself. With `format_urls` off nothing
+    // would, and the annotation is not in the page's link list either — it
+    // found its text — so the destination would reach the output nowhere.
+    let buf = make_linked_page_pdf();
+    let options = PdfOptions {
+        markdown: MarkdownOptions {
+            format_urls: false,
+            ..MarkdownOptions::default()
+        },
+        ..PdfOptions::new()
+    };
+    let markdown = process_pdf_mem_with_options(&buf, options)
+        .unwrap()
+        .markdown
+        .expect("markdown");
+
+    assert!(
+        markdown.contains("[https://example.com/shop](https://example.com/shop)"),
+        "expected the bare URL anchored by its own annotation, got:\n{markdown}"
+    );
+    assert!(
+        markdown.contains("Fonte: [Statista, 2024](https://statista.com/report)"),
+        "expected the ordinary anchor untouched, got:\n{markdown}"
+    );
+    assert!(
+        markdown.contains("- <https://example.com/logo-target> on ![Image: Im0](image)"),
+        "expected the unanchored link still listed, got:\n{markdown}"
+    );
+}
+
+#[test]
+fn a_url_broken_across_lines_keeps_the_destination_it_points_at() {
+    // The producer split each of these URLs after a hyphen and hung one
+    // annotation on each visual line, so neither half spells its own
+    // destination. Leaving a half plain hands `format_urls` a URL truncated
+    // at the break: the anchor then points at a page that does not exist and
+    // the real destination reaches the Markdown nowhere.
+    let markdown = markdown_of_pages("tests/fixtures/multiline_indent_cell_rect_grid.pdf", &[113]);
+    assert!(
+        markdown.contains(
+            "](https://docs.microsoft.com/DeployEdge/microsoft-edge-policies#audiosandboxenabled)"
+        ),
+        "the split URL's real destination is missing from:\n{markdown}"
+    );
+
+    let markdown = markdown_of_pages("tests/fixtures/multiline_indent_cell_rect_grid.pdf", &[46]);
+    assert!(
+        markdown.contains(
+            "](https://docs.microsoft.com/DeployEdge/microsoft-edge-policies\
+             #allowcrossoriginauthprompt)"
+        ),
+        "the split URL's real destination is missing from:\n{markdown}"
+    );
+}
+
+#[test]
+fn a_destination_the_reader_cannot_follow_never_reaches_the_markdown() {
+    // Page 43 hangs two annotations on a reference the viewer expands in
+    // place, both pointing at `javascript:void(0)`. The words stay; the
+    // gesture is not a place a reader of the Markdown can go.
+    let annotations: Vec<String> = extract_text_with_positions_pages(
+        "tests/fixtures/bits_pilani_feedback.pdf",
+        Some(&HashSet::from([43])),
+    )
+    .unwrap()
+    .into_iter()
+    .filter_map(|item| match item.item_type {
+        ItemType::Link(url) => Some(url),
+        _ => None,
+    })
+    .collect();
+    assert_eq!(
+        annotations,
+        vec!["javascript:void(0)".to_string(); 2],
+        "the annotations are read from the file either way"
+    );
+
+    let markdown = markdown_of_pages("tests/fixtures/bits_pilani_feedback.pdf", &[43]);
+    assert!(
+        !markdown.contains("javascript:"),
+        "a script destination reached the markdown:\n{markdown}"
+    );
+    assert!(
+        markdown.contains("Revisiting Models of"),
+        "the words under the rectangle must stay, unwrapped:\n{markdown}"
+    );
+    assert!(
+        listed_destinations(&markdown).is_empty(),
+        "a script destination must not be listed either"
+    );
+}
+
+#[test]
+fn no_anchor_is_made_of_punctuation_alone() {
+    // Snapping the right edge of a rectangle to the start of the next word
+    // hands back the characters between the two, and every one of these pages
+    // used to spend an annotation on `[.](…)` or `[,](…)`.
+    for (fixture, pages) in [
+        (
+            "tests/fixtures/bits_pilani_feedback.pdf",
+            &[45, 57, 126][..],
+        ),
+        (
+            "tests/fixtures/multiline_indent_cell_rect_grid.pdf",
+            &[8, 9, 16, 46, 113][..],
+        ),
+    ] {
+        let markdown = markdown_of_pages(fixture, pages);
+        let wordless: Vec<(String, String)> = inline_links(&markdown)
+            .into_iter()
+            .filter(|(anchor, _)| {
+                !anchor.trim().is_empty() && !anchor.chars().any(char::is_alphanumeric)
+            })
+            .collect();
+        assert!(
+            wordless.is_empty(),
+            "{fixture} pages {pages:?}: {} anchors carry no word: {:?}",
+            wordless.len(),
+            &wordless[..wordless.len().min(3)]
+        );
+        // Positive control: these pages are anchored, so an extraction that
+        // simply stopped producing links could not pass the check above.
+        assert!(
+            inline_links(&markdown).len() >= pages.len(),
+            "{fixture} pages {pages:?}: expected at least one anchor per page, got {}",
+            inline_links(&markdown).len()
+        );
+    }
+}
+
+#[test]
+fn a_page_lists_only_the_destinations_nothing_else_carries() {
+    // 41 annotations over 24 destinations on one page, several rectangles per
+    // URL. Judged per annotation the page listed five entries, two of them a
+    // repeat of an entry above and all five already anchored in the text.
+    // Judged per destination it lists none.
+    let buf = std::fs::read("tests/fixtures/shifted_cipher_tounicode.pdf").unwrap();
+    let markdown = process_pdf_mem(&buf).unwrap().markdown.expect("markdown");
+
+    assert!(
+        listed_destinations(&markdown).is_empty(),
+        "every destination is anchored, so the page needs no list: {:?}",
+        listed_destinations(&markdown)
+    );
+    assert!(
+        !markdown.contains("**Links on this page**"),
+        "an empty list must not be emitted at all"
+    );
+}
+
+#[test]
+fn every_followable_destination_of_a_reference_list_reaches_the_markdown() {
+    // Pages 45–62 are the publication list: one annotation per citation, 34
+    // distinct DOIs and article URLs, several of them broken across lines by
+    // the producer. Every one must be somewhere a reader can follow it — on
+    // its anchor, or in its page's list.
+    let pages: Vec<u32> = (45..=62).collect();
+    let mut destinations: Vec<String> = extract_text_with_positions_pages(
+        "tests/fixtures/bits_pilani_feedback.pdf",
+        Some(&pages.iter().copied().collect()),
+    )
+    .unwrap()
+    .into_iter()
+    .filter_map(|item| match item.item_type {
+        ItemType::Link(url) if url.starts_with("http") => Some(url),
+        _ => None,
+    })
+    .collect();
+    destinations.sort();
+    destinations.dedup();
+    assert_eq!(destinations.len(), 34, "distinct followable destinations");
+
+    let markdown = markdown_of_pages("tests/fixtures/bits_pilani_feedback.pdf", &pages);
+    let missing: Vec<&String> = destinations
+        .iter()
+        .filter(|url| {
+            !markdown.contains(&format!("]({url})"))
+                && !markdown.contains(&format!("](<{url}>)"))
+                && !markdown.contains(&format!("- <{url}>"))
+        })
+        .collect();
+    assert!(missing.is_empty(), "destinations lost: {missing:?}");
 }

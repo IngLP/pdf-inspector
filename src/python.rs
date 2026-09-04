@@ -275,6 +275,45 @@ impl PyPageRegionTexts {
 // Text item wrapper
 // ---------------------------------------------------------------------------
 
+/// A hyperlink annotation and the anchor text it was attached to.
+#[pyclass(name = "MarkdownLink")]
+#[derive(Clone)]
+pub struct PyMarkdownLink {
+    /// Destination URI.
+    #[pyo3(get)]
+    pub url: String,
+    /// The annotation's rectangle as `(x, y, width, height)`, with `y` the
+    /// bottom edge growing upward, in the same frame as `TextItem`.
+    #[pyo3(get)]
+    pub rect: (f32, f32, f32, f32),
+    /// 1-indexed page carrying the annotation.
+    #[pyo3(get)]
+    pub page: u32,
+    /// The text under the rectangle, when there is any.
+    #[pyo3(get)]
+    pub anchor: Option<String>,
+    /// True when the anchor text was found on a line or in a table cell handed
+    /// to the Markdown renderer — normally meaning the link is in the output as
+    /// `[anchor](url)`, though a line the renderer then drops leaves this True
+    /// with no visible link. False says only that none carried it: `anchor` is
+    /// often set alongside it. Those destinations are what the page's "Links on
+    /// this page" list exists for, and that list leaves out a destination
+    /// already anchored on the page and one whose scheme the Markdown does not
+    /// carry (`javascript:`, a bare `#`); `url` is the complete record.
+    #[pyo3(get)]
+    pub anchored_inline: bool,
+}
+
+#[pymethods]
+impl PyMarkdownLink {
+    fn __repr__(&self) -> String {
+        format!(
+            "MarkdownLink(page={}, url='{}', rect={:?}, anchor={:?}, anchored_inline={})",
+            self.page, self.url, self.rect, self.anchor, self.anchored_inline
+        )
+    }
+}
+
 /// Per-page markdown extraction result.
 #[pyclass(name = "PageMarkdown")]
 #[derive(Clone)]
@@ -292,6 +331,9 @@ pub struct PyPageMarkdown {
     /// Machine-readable OCR reason when the cause is known.
     #[pyo3(get)]
     pub ocr_reason: Option<String>,
+    /// Every hyperlink annotation on this page.
+    #[pyo3(get)]
+    pub links: Vec<PyMarkdownLink>,
 }
 
 #[pymethods]
@@ -653,6 +695,16 @@ fn parse_page_regions(
         .collect()
 }
 
+fn to_py_markdown_link(link: crate::markdown::links::MarkdownLink) -> PyMarkdownLink {
+    PyMarkdownLink {
+        url: link.url,
+        rect: link.rect,
+        page: link.page,
+        anchor: link.anchor,
+        anchored_inline: link.anchored_inline,
+    }
+}
+
 fn to_py_pages_result(r: crate::PagesExtractionResult) -> PyPagesExtractionResult {
     PyPagesExtractionResult {
         pages: r
@@ -663,6 +715,7 @@ fn to_py_pages_result(r: crate::PagesExtractionResult) -> PyPagesExtractionResul
                 markdown: p.markdown,
                 needs_ocr: p.needs_ocr,
                 ocr_reason: p.ocr_reason,
+                links: p.links.into_iter().map(to_py_markdown_link).collect(),
             })
             .collect(),
         pages_with_tables: r.pages_with_tables,
@@ -1043,6 +1096,7 @@ fn pdf_inspector(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyStructureElement>()?;
     m.add_class::<PyRegionText>()?;
     m.add_class::<PyPageRegionTexts>()?;
+    m.add_class::<PyMarkdownLink>()?;
     m.add_class::<PyPageMarkdown>()?;
     m.add_class::<PyPagesExtractionResult>()?;
     m.add_function(wrap_pyfunction!(process_pdf, m)?)?;
