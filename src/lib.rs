@@ -55,10 +55,12 @@ pub use extractor::{
     extract_text_with_positions_mem, extract_text_with_positions_pages,
     extract_text_with_positions_pages_with_password,
 };
+pub use markdown::links::MarkdownLink;
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
 };
+
 pub use process_mode::ProcessMode;
 pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
 
@@ -420,6 +422,30 @@ pub struct PageMarkdown {
     pub needs_ocr: bool,
     /// Machine-readable OCR reason when the cause is known.
     pub ocr_reason: Option<String>,
+    /// Every `/Link /URI` annotation on this page, with the anchor text it
+    /// was attached to.
+    ///
+    /// `anchored_inline` says that the anchor was found on a line or in a
+    /// table cell handed to the Markdown renderer, not that it survived into
+    /// the output: a line the renderer then drops — an empty one, a suppressed
+    /// table of contents — leaves the flag `true` with no visible link.
+    ///
+    /// `false` says only that no line or cell carried it, which is weaker than
+    /// "no text sat under the rectangle": `anchor` is often `Some` alongside
+    /// it, for a folio, a stripped running header or a cell whose joined text
+    /// the anchor could not be located in. Those destinations are what the
+    /// "Links on this page" list at the foot of each page exists for, and it
+    /// too is not exhaustive: it leaves out a destination already anchored
+    /// elsewhere on the page, and one whose scheme the Markdown does not carry
+    /// (`javascript:`, a bare `#`). This field is the complete record.
+    ///
+    /// Reported even for a page routed to OCR, whose `markdown` is
+    /// suppressed: the annotation is exact file data, so only
+    /// `anchored_inline` goes false. A page whose text failed the quality
+    /// check reports its annotations with no `anchor`, since nothing
+    /// extraction produced there is trustworthy. Empty when
+    /// `MarkdownOptions::include_links` is off.
+    pub links: Vec<markdown::links::MarkdownLink>,
 }
 
 /// Combined per-page markdown extraction and layout classification result.
@@ -592,6 +618,7 @@ fn extract_pages_markdown_mem_impl(
                 markdown: String::new(),
                 needs_ocr: true,
                 ocr_reason: None,
+                links: Vec::new(),
             });
             continue;
         }
@@ -662,10 +689,15 @@ fn extract_pages_markdown_mem_impl(
             ..markdown_options.clone()
         };
 
-        let md = if has_text_quality_issue {
-            String::new()
+        let (md, page_links) = if has_text_quality_issue {
+            // Conversion is skipped, so no anchor can be found — but the
+            // annotations are read from the file, not from the suspect text.
+            (
+                String::new(),
+                markdown::links::unanchored(&page_items, options.include_links),
+            )
         } else {
-            markdown::to_markdown_from_items_with_rects_and_lines(
+            markdown::markdown_and_links_from_items_with_rects_and_lines(
                 page_items,
                 options,
                 &page_rects,
@@ -683,8 +715,14 @@ fn extract_pages_markdown_mem_impl(
             )
         };
 
+        // Whether the page needs OCR is a verdict on the text extraction
+        // produced. The per-page list of link destinations is clean ASCII
+        // taken from the annotations, so it neither makes an empty page look
+        // extracted nor dilutes the garbage ratios.
+        let extracted_text = markdown::links::without_link_lists(&md);
         let has_decoding_issue = has_text_quality_issue
-            || (!md.is_empty() && (is_cid_garbage(&md) || detect_encoding_issues(&md)));
+            || (!extracted_text.is_empty()
+                && (is_cid_garbage(&extracted_text) || detect_encoding_issues(&extracted_text)));
         if has_decoding_issue {
             add_ocr_reason(
                 &mut ocr_reasons_by_page,
@@ -701,9 +739,9 @@ fn extract_pages_markdown_mem_impl(
         let ocr_reason = page_ocr_reason(&ocr_reasons_by_page, page_1idx);
 
         let needs_ocr = ocr_reason.is_some()
-            || md.trim().is_empty()
+            || extracted_text.trim().is_empty()
             || has_gid
-            || is_garbage_text(&md)
+            || is_garbage_text(&extracted_text)
             || has_template_image
             || has_vector_text;
 
@@ -724,6 +762,23 @@ fn extract_pages_markdown_mem_impl(
             },
             needs_ocr,
             ocr_reason,
+            // Unlike the text, the annotations survive OCR routing: a
+            // `/Link /URI` rectangle is exact data read from the file, not
+            // something extraction could have garbled. But a suppressed page
+            // emits no Markdown, so nothing there is anchored: the flag has
+            // to say so, or a consumer rendering only the unanchored links
+            // would drop every destination on the page.
+            links: if needs_ocr && !preserve_ocr_candidates {
+                page_links
+                    .into_iter()
+                    .map(|link| markdown::links::MarkdownLink {
+                        anchored_inline: false,
+                        ..link
+                    })
+                    .collect()
+            } else {
+                page_links
+            },
         });
     }
 

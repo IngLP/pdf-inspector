@@ -257,8 +257,16 @@ class PageRegionTexts:               # extract_text_in_regions
     page: int                        # 0-indexed
     regions: list[RegionText]
 
+class MarkdownLink:                  # PageMarkdown.links
+    url: str
+    rect: tuple[float, float, float, float]   # (x, y, width, height), y grows upward
+    page: int                        # 1-indexed
+    anchor: str | None               # text under the rectangle, when there is any
+    anchored_inline: bool            # True: a rendered line or table cell carried the anchor.
+                                     # False: none did — `anchor` may still be set. See the stub.
+
 class PagesExtractionResult:         # extract_pages_markdown
-    pages: list[PageMarkdown]        # PageMarkdown: page (0-indexed), markdown, needs_ocr, ocr_reason
+    pages: list[PageMarkdown]        # PageMarkdown: page (0-indexed), markdown, needs_ocr, ocr_reason, links
     pages_with_tables: list[int]     # 1-indexed
     pages_with_columns: list[int]    # 1-indexed
     pages_needing_ocr: list[int]     # 1-indexed

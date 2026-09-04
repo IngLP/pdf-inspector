@@ -643,6 +643,7 @@ fn clone_native_page(page: &PageMarkdown) -> PageMarkdown {
         markdown: page.markdown.clone(),
         needs_ocr: page.needs_ocr,
         ocr_reason: page.ocr_reason.clone(),
+        links: page.links.clone(),
     }
 }
 
@@ -1185,6 +1186,7 @@ mod tests {
                 markdown: String::new(),
                 needs_ocr: true,
                 ocr_reason: Some(crate::OCR_REASON_SCANNED.to_string()),
+                links: Vec::new(),
             })
             .collect::<Vec<_>>();
         let routed_pages = (1..=10).collect::<Vec<_>>();

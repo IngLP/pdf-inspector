@@ -1071,6 +1071,7 @@ mod tests {
             markdown: markdown.to_string(),
             needs_ocr,
             ocr_reason: needs_ocr.then(|| "scanned".to_string()),
+            links: Vec::new(),
         }
     }
 

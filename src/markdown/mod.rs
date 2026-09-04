@@ -11,6 +11,7 @@ mod classify;
 mod convert;
 mod furniture;
 mod heading;
+pub mod links;
 mod postprocess;
 mod preprocess;
 
@@ -848,22 +849,35 @@ enum TableOutputMode {
     CompleteTables,
 }
 
-struct TableDetectionOutput {
+struct TableDetectionOutput<'a> {
     mode: TableOutputMode,
     pages_with_detected_tables: HashSet<u32>,
     pages_with_tables: HashSet<u32>,
     markdown_by_page: HashMap<u32, Vec<PositionedMarkdown>>,
+    /// Hyperlink annotations by page, and the text under each, so a table cell
+    /// can carry the anchor its items were joined out of.
+    link_anchors: &'a HashMap<u32, crate::types::PageLinkAnchors>,
+    link_anchor_texts: &'a HashMap<(u32, usize), String>,
+    /// Annotations a cell has already claimed, with the text it wrapped.
+    anchored_in_tables: HashMap<(u32, usize), String>,
     #[cfg(feature = "ocr")]
     complete_tables: Vec<(u32, crate::tables::Table)>,
 }
 
-impl TableDetectionOutput {
-    fn new(mode: TableOutputMode) -> Self {
+impl<'a> TableDetectionOutput<'a> {
+    fn new(
+        mode: TableOutputMode,
+        link_anchors: &'a HashMap<u32, crate::types::PageLinkAnchors>,
+        link_anchor_texts: &'a HashMap<(u32, usize), String>,
+    ) -> Self {
         Self {
             mode,
             pages_with_detected_tables: HashSet::new(),
             pages_with_tables: HashSet::new(),
             markdown_by_page: HashMap::new(),
+            link_anchors,
+            link_anchor_texts,
+            anchored_in_tables: HashMap::new(),
             #[cfg(feature = "ocr")]
             complete_tables: Vec::new(),
         }
@@ -879,13 +893,24 @@ impl TableDetectionOutput {
         match self.mode {
             TableOutputMode::Markdown => {
                 self.pages_with_tables.insert(page);
+                // Only the emitted Markdown carries the anchors: the tables
+                // handed to OCR fusion stay as the detectors built them.
+                let anchored = self.link_anchors.get(&page).and_then(|anchors| {
+                    links::anchor_table_cells(
+                        page,
+                        table,
+                        anchors,
+                        self.link_anchor_texts,
+                        &mut self.anchored_in_tables,
+                    )
+                });
                 self.markdown_by_page
                     .entry(page)
                     .or_default()
                     .push(PositionedMarkdown::new(
                         table.rows.first().copied().unwrap_or(0.0),
                         table.columns.first().copied().unwrap_or(0.0),
-                        crate::tables::table_to_markdown(table),
+                        crate::tables::table_to_markdown(anchored.as_ref().unwrap_or(table)),
                         chart_order,
                     ));
             }
@@ -908,9 +933,20 @@ impl TableDetectionOutput {
     }
 }
 
+/// Name an image placeholder item carries in the Markdown, from the
+/// `"[Image: NAME]"` text extraction gives it.
+fn image_placeholder_name(text: &str) -> &str {
+    text.strip_prefix("[Image: ")
+        .and_then(|name| name.strip_suffix(']'))
+        .unwrap_or(text)
+}
+
 #[derive(Default)]
 struct MarkdownConversionOutput {
     markdown: String,
+    /// Every `/Link /URI` annotation of the converted items, with the anchor
+    /// it reached. Empty when `MarkdownOptions::include_links` is off.
+    links: Vec<links::MarkdownLink>,
     #[cfg(feature = "ocr")]
     detected_tables: Vec<(u32, crate::tables::Table)>,
 }
@@ -1466,15 +1502,28 @@ pub(crate) fn to_markdown_from_items_with_rects_and_lines(
     pdf_lines: &[crate::types::PdfLine],
     context: MarkdownDocumentContext<'_>,
 ) -> String {
-    convert_items_with_rects_lines_and_table_output(
+    markdown_and_links_from_items_with_rects_and_lines(items, options, rects, pdf_lines, context).0
+}
+
+/// Same conversion as [`to_markdown_from_items_with_rects_and_lines`], also
+/// reporting what became of every `/Link /URI` annotation, so a caller does
+/// not have to read the links back out of the Markdown it just produced.
+pub(crate) fn markdown_and_links_from_items_with_rects_and_lines(
+    items: Vec<TextItem>,
+    options: MarkdownOptions,
+    rects: &[crate::types::PdfRect],
+    pdf_lines: &[crate::types::PdfLine],
+    context: MarkdownDocumentContext<'_>,
+) -> (String, Vec<links::MarkdownLink>) {
+    let conversion = convert_items_with_rects_lines_and_table_output(
         items,
         options,
         rects,
         pdf_lines,
         context,
         TableOutputMode::Markdown,
-    )
-    .markdown
+    );
+    (conversion.markdown, conversion.links)
 }
 
 /// Run the ordinary Markdown table pipeline but return only structurally
@@ -1560,7 +1609,8 @@ fn convert_items_with_rects_lines_and_table_output(
     // Separate images and links from text items
     let mut images: Vec<TextItem> = Vec::new();
     let mut page_image_regions: HashMap<u32, Vec<(f32, f32, f32, f32)>> = HashMap::new();
-    let mut links: Vec<TextItem> = Vec::new();
+    let mut page_images_for_links: HashMap<u32, Vec<links::PageImage>> = HashMap::new();
+    let mut link_items: Vec<TextItem> = Vec::new();
     let mut text_items: Vec<TextItem> = Vec::new();
     let mut text_item_page_number_mask: Vec<bool> = Vec::new();
 
@@ -1573,13 +1623,23 @@ fn convert_items_with_rects_lines_and_table_output(
                     item.x + item.width,
                     item.y + item.height,
                 ));
+                page_images_for_links
+                    .entry(item.page)
+                    .or_default()
+                    .push(links::PageImage {
+                        x0: item.x,
+                        y0: item.y,
+                        x1: item.x + item.width,
+                        y1: item.y + item.height,
+                        name: image_placeholder_name(&item.text).to_string(),
+                    });
                 if options.include_images {
                     images.push(item);
                 }
             }
             ItemType::Link(_) => {
                 if options.include_links {
-                    links.push(item);
+                    link_items.push(item);
                 }
             }
             ItemType::Text | ItemType::FormField => {
@@ -1602,7 +1662,25 @@ fn convert_items_with_rects_lines_and_table_output(
 
     // Detect tables on each page
     let mut table_items: HashSet<usize> = HashSet::new();
-    let mut table_output = TableDetectionOutput::new(table_output_mode);
+    // Hyperlink anchoring needs the annotations before table detection: a
+    // table claims its items, so a cell must carry the anchor itself.
+    let mut link_anchors = links::anchors_by_page(&link_items);
+    let link_anchor_texts = links::anchor_texts(text_items.iter(), &link_anchors);
+    // An annotation whose whole anchor spells its own URL is left undecorated
+    // wherever it renders: `format_urls` links a bare URL already, and the
+    // brackets would sit between a line-break hyphen and the halves that
+    // postprocessing rejoins. That hand-off is only safe while `format_urls`
+    // is on; with it off nothing would pick the bare URL up, and the
+    // destination would reach neither the text nor the page's link list, which
+    // skips the annotation as anchored.
+    if options.format_urls {
+        for (page, anchors) in link_anchors.iter_mut() {
+            anchors.mark_urls_written_out(|index| link_anchor_texts.get(&(*page, index)).cloned());
+        }
+    }
+    let link_anchors = link_anchors;
+    let mut table_output =
+        TableDetectionOutput::new(table_output_mode, &link_anchors, &link_anchor_texts);
 
     // Running headers/footers repeat verbatim at the same position on many
     // pages. When such a block wraps a long title over aligned lines, the
@@ -2154,11 +2232,7 @@ fn convert_items_with_rects_lines_and_table_output(
     // logical chart-page position as tables before reinsertion.
     let mut page_images: HashMap<u32, Vec<PositionedMarkdown>> = HashMap::new();
     for img in &images {
-        let img_name = img
-            .text
-            .strip_prefix("[Image: ")
-            .and_then(|s| s.strip_suffix(']'))
-            .unwrap_or(&img.text);
+        let img_name = image_placeholder_name(&img.text);
         let img_md = format!("![Image: {}](image)\n", img_name);
         page_images
             .entry(img.page)
@@ -2413,6 +2487,24 @@ fn convert_items_with_rects_lines_and_table_output(
     // Convert to markdown, inserting tables and images at appropriate positions
     let mut band_split_page_set: HashSet<u32> = page_band_splits.keys().copied().collect();
     band_split_page_set.extend(page_chart_prose_splits.keys().copied());
+    let resolved_links = links::resolve(
+        &link_anchors,
+        &lines,
+        &link_anchor_texts,
+        &table_output.anchored_in_tables,
+    );
+    let page_link_lists: HashMap<u32, String> = resolved_links
+        .iter()
+        .filter(|link| !link.anchored_inline)
+        .map(|link| link.page)
+        .collect::<HashSet<u32>>()
+        .into_iter()
+        .filter_map(|page| {
+            links::page_link_list(page, &resolved_links, &page_images_for_links)
+                .map(|list| (page, list))
+        })
+        .collect();
+
     let markdown = to_markdown_from_lines_with_tables_and_images(
         lines,
         options,
@@ -2421,9 +2513,14 @@ fn convert_items_with_rects_lines_and_table_output(
         &page_chart_map,
         &band_split_page_set,
         effective_struct_roles,
+        convert::PageLinks {
+            anchors: &link_anchors,
+            page_lists: &page_link_lists,
+        },
     );
     MarkdownConversionOutput {
         markdown,
+        links: resolved_links,
         #[cfg(feature = "ocr")]
         detected_tables,
     }
@@ -2438,7 +2535,13 @@ mod tests {
     #[cfg(feature = "ocr")]
     #[test]
     fn complete_table_output_marks_only_pages_with_emitted_tables() {
-        let mut output = TableDetectionOutput::new(TableOutputMode::CompleteTables);
+        let no_anchors = HashMap::new();
+        let no_anchor_texts = HashMap::new();
+        let mut output = TableDetectionOutput::new(
+            TableOutputMode::CompleteTables,
+            &no_anchors,
+            &no_anchor_texts,
+        );
         let incomplete = crate::tables::Table::new(
             vec![100.0, 200.0],
             vec![300.0],

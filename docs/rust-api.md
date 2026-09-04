@@ -554,6 +554,7 @@ Low-level detection functions are also available via the `detector` module (`det
 | `PageRotation` | `Upright`, `Ccw`, `Cw`: how a predominantly rotated page's coordinate frame was turned so its text reads left-to-right |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
-| `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
+| `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr, links |
+| `MarkdownLink` | One `/Link /URI` annotation: url, rect, page, anchor, anchored_inline |
 | `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, is_complex |
 | `PdfError` | `Io`, `Parse`, `Encrypted`, `InvalidStructure`, `NotAPdf` |

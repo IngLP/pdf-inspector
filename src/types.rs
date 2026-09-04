@@ -381,6 +381,406 @@ pub(crate) fn stacked_fraction_slash(prev: &TextItem, item: &TextItem) -> bool {
         && prev.x < item.x + item.width
 }
 
+/// Share of a text span's own height that must lie inside a link rectangle
+/// before the span counts as decorated by that link.
+///
+/// Normalising on the span, not on the rectangle, is what makes the test
+/// robust: a `/Rect` is nearly always more generous than the line it
+/// decorates (vertical padding, sometimes two lines), so a ratio taken on the
+/// rectangle's area would be arbitrarily small for a correct match.
+///
+/// The value is a plateau, not a tuned constant. Measured over the 360
+/// `/Link /URI` annotations of a 205-page real document, the number of links
+/// with at least one qualifying span is 334 at *every* threshold from 0.3 to
+/// 0.8: no span in that corpus overlaps a rectangle by an ambiguous fraction
+/// of its height. 0.5 sits in the middle of that empty valley. (Contrast the
+/// area ratio the Python prototype used, which is not flat at all over the
+/// same corpus: 334 links at 0.05, 328 at 0.20, 323 at 0.30, 306 at 0.50.)
+const ANCHOR_VERTICAL_OVERLAP: f32 = 0.5;
+
+/// A `/Link /URI` annotation reduced to what anchoring needs: where it sits
+/// and where it points.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LinkAnchor {
+    /// Destination URI of the annotation's `/A` action.
+    pub(crate) url: String,
+    /// Left edge of the annotation's `/Rect`, in the same frame as
+    /// [`TextItem::x`].
+    pub(crate) x: f32,
+    /// Bottom edge of the annotation's `/Rect`.
+    pub(crate) y: f32,
+    /// Width of the annotation's `/Rect`.
+    pub(crate) width: f32,
+    /// Height of the annotation's `/Rect`.
+    pub(crate) height: f32,
+    /// `true` when the text under the whole rectangle spells this very URL,
+    /// so the reader already sees the destination.
+    ///
+    /// Decided over the annotation's complete anchor, not over one run of it:
+    /// a producer breaks a long URL across two lines, and each half on its own
+    /// looks like ordinary anchor text. See
+    /// [`PageLinkAnchors::mark_urls_written_out`].
+    pub(crate) writes_out_url: bool,
+}
+
+impl LinkAnchor {
+    /// Middle of the rectangle.
+    pub(crate) fn centre(&self) -> (f32, f32) {
+        (self.x + self.width / 2.0, self.y + self.height / 2.0)
+    }
+
+    /// Share of `item`'s height that lies inside this rectangle.
+    fn vertical_overlap(&self, item: &TextItem) -> f32 {
+        if item.height <= 0.0 {
+            return 0.0;
+        }
+        let overlap = (self.y + self.height).min(item.y + item.height) - self.y.max(item.y);
+        overlap.max(0.0) / item.height
+    }
+
+    /// Character range of `text` this rectangle covers, snapped to the nearest
+    /// word boundary at each end, or `None` when the rectangle covers none of
+    /// the span.
+    ///
+    /// A producer routinely merges a whole visual line into one span
+    /// ("Fonte: Linkedin. Jordan Blake. Medium.") and then hangs a separate
+    /// annotation on each name in it. Taking the whole span as the anchor
+    /// would give all three links the same wrong text and let only one of them
+    /// be emitted, so the span is cut where the rectangle cuts it.
+    ///
+    /// The cut assumes a uniform advance across the span, which is only
+    /// approximate for a proportional face; snapping each end to the nearest
+    /// word boundary absorbs the error, since a boundary is many characters
+    /// away while the estimate is off by one or two.
+    fn char_range(&self, item: &TextItem) -> Option<(usize, usize)> {
+        if item.width <= 0.0 || self.vertical_overlap(item) < ANCHOR_VERTICAL_OVERLAP {
+            return None;
+        }
+        let start_x = self.x.max(item.x);
+        let end_x = (self.x + self.width).min(item.x + item.width);
+        if end_x <= start_x {
+            return None;
+        }
+        let chars: Vec<char> = item.text.chars().collect();
+        let count = chars.len();
+        if count == 0 {
+            return None;
+        }
+        let advance = item.width / count as f32;
+        let start = nearest_word_boundary(&chars, (start_x - item.x) / advance);
+        let end = nearest_word_boundary(&chars, (end_x - item.x) / advance);
+        if start >= end || !chars[start..end].iter().any(|c| c.is_alphanumeric()) {
+            // Snapping the right edge to the *start* of the following word
+            // hands back the stray characters between the two: the full stop
+            // after "…@cisecurity.org", the comma between two linked names.
+            // `[.](mailto:…)` is not an anchor anyone reads, and a rectangle
+            // whose only claim on a span is punctuation has not found its
+            // text there — it either covers the real words in another span or
+            // belongs in the page's link list.
+            return None;
+        }
+        Some((start, end))
+    }
+}
+
+/// Index of the word boundary closest to `position`, measured in characters
+/// from the start of `chars`. Boundaries are the two ends plus the first
+/// character of every word.
+fn nearest_word_boundary(chars: &[char], position: f32) -> usize {
+    let mut best = 0usize;
+    let mut best_distance = position.abs();
+    let mut consider = |index: usize| {
+        let distance = (index as f32 - position).abs();
+        if distance < best_distance {
+            best = index;
+            best_distance = distance;
+        }
+    };
+    for index in 1..chars.len() {
+        if chars[index - 1].is_whitespace() && !chars[index].is_whitespace() {
+            consider(index);
+        }
+    }
+    consider(chars.len());
+    best
+}
+
+/// The link annotations of one page, queried per text item while a line is
+/// rendered.
+///
+/// Empty for every page of a document without hyperlinks, which is the case
+/// the lookup short-circuits on.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct PageLinkAnchors {
+    anchors: Vec<LinkAnchor>,
+}
+
+/// One link's claim on a stretch of a text item: the character range of
+/// `TextItem::text` it decorates and where it points.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AnchoredRange<'a> {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    /// Mirrors [`LinkAnchor::writes_out_url`] for the claiming annotation.
+    pub(crate) writes_out_url: bool,
+    /// Position of the claiming annotation in the page's anchor list, so a
+    /// caller can tell two annotations apart when they share a URL.
+    pub(crate) index: usize,
+    pub(crate) url: &'a str,
+}
+
+impl PageLinkAnchors {
+    pub(crate) fn new(anchors: Vec<LinkAnchor>) -> Self {
+        Self { anchors }
+    }
+
+    /// The page's annotations, in the order `ranges_for` indexes them.
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, LinkAnchor> {
+        self.anchors.iter()
+    }
+
+    /// Record which annotations have their own URL as their visible text.
+    ///
+    /// `anchor_text` returns the text under an annotation's whole rectangle,
+    /// by its position in this list. Whitespace is ignored in the comparison
+    /// because the text carries the producer's line break where the URL has
+    /// none.
+    pub(crate) fn mark_urls_written_out(&mut self, anchor_text: impl Fn(usize) -> Option<String>) {
+        for (index, anchor) in self.anchors.iter_mut().enumerate() {
+            anchor.writes_out_url =
+                anchor_text(index).is_some_and(|text| anchor_repeats_url(&text, &anchor.url));
+        }
+    }
+
+    /// The stretches of `item` covered by this page's links, in reading order
+    /// and never overlapping.
+    ///
+    /// A geometric answer: which annotation covers which characters. Whether
+    /// the Markdown may write that annotation's destination is a separate
+    /// question — [`Self::emittable_ranges_for`] — so a rectangle the output
+    /// leaves undecorated still reports the words it covers through
+    /// [`crate::MarkdownLink::anchor`].
+    ///
+    /// Two annotations that claim overlapping stretches of the same span are a
+    /// contradiction in the source document; the earlier stretch wins so the
+    /// emitted Markdown stays well formed, and the loser is reported as
+    /// unanchored by [`crate::markdown::links`].
+    pub(crate) fn ranges_for(&self, item: &TextItem) -> Vec<AnchoredRange<'_>> {
+        if self.anchors.is_empty() {
+            return Vec::new();
+        }
+        let mut ranges: Vec<AnchoredRange<'_>> = self
+            .anchors
+            .iter()
+            .enumerate()
+            .filter_map(|(index, anchor)| {
+                anchor.char_range(item).map(|(start, end)| AnchoredRange {
+                    start,
+                    end,
+                    writes_out_url: anchor.writes_out_url,
+                    index,
+                    url: anchor.url.as_str(),
+                })
+            })
+            .collect();
+        ranges.sort_by_key(|range| (range.start, range.end));
+        let mut kept: Vec<AnchoredRange<'_>> = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            if kept.last().is_none_or(|last| last.end <= range.start) {
+                kept.push(range);
+            }
+        }
+        kept
+    }
+
+    /// The stretches of `item` the Markdown may decorate: [`Self::ranges_for`]
+    /// without the annotations whose destination the Markdown does not carry
+    /// (see [`destination_allowed_in_markdown`]). Their text is emitted plain.
+    pub(crate) fn emittable_ranges_for(&self, item: &TextItem) -> Vec<AnchoredRange<'_>> {
+        let mut ranges = self.ranges_for(item);
+        ranges.retain(|range| destination_allowed_in_markdown(range.url));
+        ranges
+    }
+}
+
+/// True when `anchor` is the destination itself, written out: identical to
+/// `url`, ignoring the whitespace a line break puts in the text and a trailing
+/// slash the producer may have dropped.
+///
+/// The whole destination, not a long-enough stretch of it. A partial match is
+/// exactly the case a reference list produces — a URL broken over two visual
+/// lines carries one annotation per line, so each annotation's text is a
+/// fragment of its own destination — and leaving such a fragment plain hands
+/// `format_urls` a truncated URL to linkify, which both loses the real
+/// destination and invents a wrong one (`https://docs.microsoft.com/x/edge-`
+/// for a link to `…/edge-policies#audiosandboxenabled`). A fragment is
+/// wrapped, so the destination survives whatever its anchor looks like.
+pub(crate) fn anchor_repeats_url(anchor: &str, url: &str) -> bool {
+    let squeezed: String = anchor.chars().filter(|c| !c.is_whitespace()).collect();
+    squeezed == url || squeezed.trim_end_matches('/') == url.trim_end_matches('/')
+}
+
+/// A `[anchor](url)` still being assembled: where its text starts in the
+/// rendered line, and where it points.
+///
+/// It is left open until the text stops belonging to it, so a destination the
+/// producer split into several runs — a URL broken after a hyphen, a name
+/// broken after its first word — comes out as one link over the whole anchor
+/// instead of one per run. Keeping it open is also what lets the line's own
+/// spacing rules read an unpolluted tail: they inspect the last characters
+/// emitted, and a `](url)` closed too early would hide the hyphen they join on.
+struct OpenLink {
+    url: String,
+    start: usize,
+    /// The annotation writes its own URL out as the visible text, so the run
+    /// is emitted unwrapped. See [`LinkAnchor::writes_out_url`].
+    writes_out_url: bool,
+}
+
+/// Close the link `result` has been accumulating, wrapping everything since
+/// its start in `[anchor](url)`.
+///
+/// An anchor that already spells its own destination is left as it is:
+/// `MarkdownOptions::format_urls` links a bare URL in the text, so wrapping
+/// here would only produce `[https://x](https://x)`.
+fn close_open_link(result: &mut String, open: &mut Option<OpenLink>) {
+    let Some(OpenLink {
+        url,
+        start,
+        writes_out_url,
+    }) = open.take()
+    else {
+        return;
+    };
+    if writes_out_url {
+        return;
+    }
+    let anchor = result[start..].to_string();
+    let trimmed = anchor.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    // Whitespace at the edges of the anchor belongs to the text around it.
+    let lead = anchor.len() - anchor.trim_start().len();
+    let mut wrapped = String::with_capacity(anchor.len() + url.len() + 8);
+    wrapped.push_str(&anchor[..lead]);
+    wrapped.push_str(&inline_link(trimmed, &url));
+    wrapped.push_str(&anchor[lead + trimmed.len()..]);
+    result.replace_range(start.., &wrapped);
+}
+
+/// Append an item's text, opening a link at every stretch a annotation claims
+/// and leaving the last one open when it reaches the item's end.
+///
+/// `text` is the slice of `item.text` being emitted and `leading` how many of
+/// `item.text`'s characters precede it, because the ranges are indices into
+/// the item's own untrimmed text. A super/subscript run is emitted unlinked:
+/// its `<sup>` tags would have to nest inside the anchor, and a footnote
+/// marker is not anchor text anyone reads.
+fn push_item_text_with_links(
+    result: &mut String,
+    item: &TextItem,
+    text: &str,
+    leading: usize,
+    ranges: &[AnchoredRange<'_>],
+    open: &mut Option<OpenLink>,
+) {
+    if ranges.is_empty() || item.is_script() {
+        push_item_text(result, item, text);
+        return;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut cursor = 0usize;
+    for range in ranges {
+        let start = range.start.saturating_sub(leading).min(chars.len());
+        let end = range.end.saturating_sub(leading).min(chars.len());
+        if end <= start || start < cursor {
+            continue;
+        }
+        if start > cursor {
+            close_open_link(result, open);
+            result.extend(&chars[cursor..start]);
+        }
+        if open.as_ref().is_none_or(|link| link.url != range.url) {
+            close_open_link(result, open);
+            *open = Some(OpenLink {
+                url: range.url.to_string(),
+                start: result.len(),
+                writes_out_url: range.writes_out_url,
+            });
+        }
+        result.extend(&chars[start..end]);
+        cursor = end;
+    }
+    if cursor < chars.len() {
+        close_open_link(result, open);
+        result.extend(&chars[cursor..]);
+    }
+}
+
+/// Render one inline Markdown link.
+///
+/// The single place that knows how the syntax is written — bracket escaping in
+/// the anchor and angle brackets around a destination that would otherwise
+/// terminate early — so line rendering and table cells cannot disagree about
+/// it.
+pub(crate) fn inline_link(anchor: &str, url: &str) -> String {
+    let mut result = String::with_capacity(anchor.len() + url.len() + 8);
+    result.push('[');
+    for character in anchor.chars() {
+        if matches!(character, '[' | ']') {
+            result.push('\\');
+        }
+        result.push(character);
+    }
+    result.push_str("](");
+    push_link_destination(&mut result, url);
+    result.push(')');
+    result
+}
+
+/// Schemes a `/Link /URI` destination may carry into the Markdown.
+///
+/// Everything else is a navigation gesture the PDF viewer performs, not a
+/// destination a reader of the Markdown can follow: `javascript:void(0)` on a
+/// reference that expands in place, a bare `#` on a dead in-document jump.
+/// Emitting them adds noise the reader cannot act on, and hands whatever
+/// renders the Markdown downstream a script URL this crate never had a reason
+/// to produce.
+const MARKDOWN_LINK_SCHEMES: [&str; 4] = ["http", "https", "mailto", "tel"];
+
+/// True when `url` may be written into the Markdown as a link destination.
+///
+/// The annotation itself is reported either way — [`crate::MarkdownLink::url`]
+/// carries the raw URI as the file spells it — so nothing about the document
+/// is hidden from a consumer; only the emitted Markdown is kept to
+/// destinations a reader can follow.
+pub(crate) fn destination_allowed_in_markdown(url: &str) -> bool {
+    // The URI reaches here exactly as the file spells it, whitespace included
+    // (`extractor::links`), and a producer that padded it must not lose the
+    // destination over the padding.
+    let url = url.trim();
+    let Some(colon) = url.find(':') else {
+        return false;
+    };
+    let scheme = &url[..colon];
+    MARKDOWN_LINK_SCHEMES
+        .iter()
+        .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+}
+
+/// Append a link destination, wrapping it in angle brackets when it carries
+/// characters that would terminate a bare `(...)` destination.
+fn push_link_destination(result: &mut String, url: &str) {
+    if url.contains(['(', ')', ' ', '<', '>']) {
+        result.push('<');
+        result.push_str(&url.replace('<', "%3C").replace('>', "%3E"));
+        result.push('>');
+        return;
+    }
+    result.push_str(url);
+}
+
 /// Append an item's text, wrapping a super/subscript run in its tag.
 /// Shared by line rendering and table-cell joining so both emit the same
 /// markup for a run.
@@ -417,13 +817,35 @@ impl TextLine {
         format_italic: bool,
         format_decorations: bool,
     ) -> String {
+        self.text_with_formatting_and_links(
+            format_bold,
+            format_italic,
+            format_decorations,
+            &PageLinkAnchors::default(),
+        )
+    }
+
+    /// Get text with optional formatting, wrapping every stretch covered by a
+    /// link annotation in `[anchor](url)`.
+    ///
+    /// The anchor markup is applied to the formatted text only. Callers that
+    /// pattern-match the line (list markers, captions, folios) use
+    /// [`TextLine::text`], which stays free of it.
+    pub(crate) fn text_with_formatting_and_links(
+        &self,
+        format_bold: bool,
+        format_italic: bool,
+        format_decorations: bool,
+        links: &PageLinkAnchors,
+    ) -> String {
         if !format_bold && !format_italic && !format_decorations {
-            return self.text_plain();
+            return self.text_plain(links);
         }
 
         let single_char_threshold = self.adaptive_threshold;
 
         let mut result = String::new();
+        let mut open_link: Option<OpenLink> = None;
         let mut current_bold = false;
         let mut current_italic = false;
         let mut current_underline = false;
@@ -499,6 +921,25 @@ impl TextLine {
                 None
             };
 
+            // A link run ends wherever the styling changes, so an anchor
+            // never has to interleave with `**`/`<u>` markers, and ends
+            // wherever the next item is not its continuation.
+            let ranges = links.emittable_ranges_for(item);
+            let leading = text.chars().take_while(|c| c.is_whitespace()).count();
+            let continues = open_link.as_ref().is_some_and(|open| {
+                !is_script
+                    && item_bold == current_bold
+                    && item_italic == current_italic
+                    && item_underline == current_underline
+                    && item_strikeout == current_strikeout
+                    && ranges
+                        .first()
+                        .is_some_and(|range| range.url == open.url && range.start <= leading)
+            });
+            if !continues {
+                close_open_link(&mut result, &mut open_link);
+            }
+
             // Close previous styles if they change
             if current_italic && !item_italic {
                 result.push('*');
@@ -553,9 +994,19 @@ impl TextLine {
                     result.push_str(tag);
                     result.push('>');
                 }
-                None => push_item_text(&mut result, item, text_trimmed),
+                None => push_item_text_with_links(
+                    &mut result,
+                    item,
+                    text_trimmed,
+                    leading,
+                    &ranges,
+                    &mut open_link,
+                ),
             }
         }
+
+        // The anchor closes before the style markers, so it never wraps them.
+        close_open_link(&mut result, &mut open_link);
 
         // Close any remaining open styles
         if current_italic {
@@ -581,11 +1032,19 @@ impl TextLine {
     /// `<sup>…</sup>` / `<sub>…</sub>`: without the tags the marker digits
     /// would be indistinguishable from the body text they follow
     /// ("Yibo Yan1,2,3" vs "Yibo Yan<sup>1,2,3</sup>").
-    fn text_plain(&self) -> String {
+    fn text_plain(&self, links: &PageLinkAnchors) -> String {
         let single_char_threshold = self.adaptive_threshold;
 
         let mut result = String::new();
+        let mut open_link: Option<OpenLink> = None;
         for (i, item) in self.items.iter().enumerate() {
+            let ranges = links.emittable_ranges_for(item);
+            let continues = open_link.as_ref().is_some_and(|open| {
+                !item.is_script()
+                    && ranges
+                        .first()
+                        .is_some_and(|range| range.url == open.url && range.start == 0)
+            });
             if i > 0
                 && self.needs_space_between(
                     &self.items[i - 1],
@@ -594,13 +1053,26 @@ impl TextLine {
                     single_char_threshold,
                 )
             {
+                if !continues {
+                    close_open_link(&mut result, &mut open_link);
+                }
                 result.push(' ');
+            } else if !continues {
+                close_open_link(&mut result, &mut open_link);
             }
             if i > 0 && stacked_fraction_slash(&self.items[i - 1], item) {
                 result.push('/');
             }
-            push_item_text(&mut result, item, item.text.as_str());
+            push_item_text_with_links(
+                &mut result,
+                item,
+                item.text.as_str(),
+                0,
+                &ranges,
+                &mut open_link,
+            );
         }
+        close_open_link(&mut result, &mut open_link);
         result
     }
 
@@ -1013,5 +1485,435 @@ mod formatting_tests {
                 "upside_down at {rotation}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod link_anchor_tests {
+    use super::{anchor_repeats_url, ItemType, LinkAnchor, PageLinkAnchors, TextItem, TextLine};
+
+    /// A 12pt span whose glyphs occupy `width` points from `x`.
+    fn span(text: &str, x: f32, width: f32) -> TextItem {
+        TextItem {
+            text: text.to_string(),
+            x,
+            y: 100.0,
+            width,
+            height: 12.0,
+            font: "F1".to_string(),
+            font_tag: String::new(),
+            font_size: 12.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            rotation: 0.0,
+            advance_known: true,
+            item_type: ItemType::Text,
+            mcid: None,
+            baseline_shift: 0.0,
+        }
+    }
+
+    fn line(items: Vec<TextItem>) -> TextLine {
+        TextLine {
+            items,
+            y: 100.0,
+            page: 1,
+            adaptive_threshold: 0.1,
+        }
+    }
+
+    /// A rectangle covering the span's full height, from `x` for `width`.
+    fn anchor(url: &str, x: f32, width: f32) -> LinkAnchor {
+        LinkAnchor {
+            url: url.to_string(),
+            x,
+            y: 97.0,
+            width,
+            height: 18.0,
+            writes_out_url: false,
+        }
+    }
+
+    #[test]
+    fn rectangle_over_a_whole_span_anchors_all_of_it() {
+        let line = line(vec![span("Statista", 10.0, 48.0)]);
+        let anchors = PageLinkAnchors::new(vec![anchor("https://statista.com", 8.0, 52.0)]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "[Statista](https://statista.com)"
+        );
+    }
+
+    #[test]
+    fn three_rectangles_over_one_merged_span_each_take_their_own_words() {
+        // The producer merged a whole source line into one span and hung a
+        // separate annotation on each name in it. 38 characters over 190pt
+        // is 5pt per character: "Linkedin." starts at char 7, "Jordan
+        // Blake." at char 17, "Medium." at char 31.
+        let line = line(vec![span(
+            "Fonte: Linkedin. Jordan Blake. Medium.",
+            10.0,
+            190.0,
+        )]);
+        let anchors = PageLinkAnchors::new(vec![
+            anchor("https://linkedin.com", 45.0, 45.0),
+            anchor("https://jordanblake.co.uk", 95.0, 65.0),
+            anchor("https://medium.com", 165.0, 35.0),
+        ]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "Fonte: [Linkedin.](https://linkedin.com) \
+             [Jordan Blake.](https://jordanblake.co.uk) [Medium.](https://medium.com)"
+        );
+    }
+
+    #[test]
+    fn a_generously_drawn_rectangle_still_anchors_its_span() {
+        // Producers draw a link rectangle with vertical padding: 36pt of
+        // rectangle around a 12pt span. The overlap is the whole span but
+        // only a third of the rectangle, so a ratio taken on the rectangle
+        // would reject the match that is plainly correct.
+        let line = line(vec![span("Statista", 10.0, 48.0)]);
+        let anchors = PageLinkAnchors::new(vec![LinkAnchor {
+            url: "https://statista.com".to_string(),
+            x: 8.0,
+            y: 88.0,
+            width: 52.0,
+            height: 36.0,
+            writes_out_url: false,
+        }]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "[Statista](https://statista.com)"
+        );
+    }
+
+    #[test]
+    fn a_rectangle_beside_the_span_anchors_nothing() {
+        let line = line(vec![span("Statista", 10.0, 48.0)]);
+        let anchors = PageLinkAnchors::new(vec![anchor("https://statista.com", 200.0, 52.0)]);
+
+        assert!(anchors.ranges_for(&line.items[0]).is_empty());
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "Statista"
+        );
+    }
+
+    #[test]
+    fn a_rectangle_on_the_line_below_anchors_nothing() {
+        // Same x, a full line lower: the vertical share of the span inside
+        // the rectangle is nil.
+        let line = line(vec![span("Statista", 10.0, 48.0)]);
+        let anchors = PageLinkAnchors::new(vec![LinkAnchor {
+            url: "https://statista.com".to_string(),
+            x: 8.0,
+            y: 79.0,
+            width: 52.0,
+            height: 18.0,
+            writes_out_url: false,
+        }]);
+
+        assert!(anchors.ranges_for(&line.items[0]).is_empty());
+    }
+
+    #[test]
+    fn an_annotation_that_writes_out_its_url_is_left_for_url_formatting() {
+        // Wrapping here would emit `[https://example.com](https://example.com)`;
+        // `MarkdownOptions::format_urls` links the bare URL instead.
+        let line = line(vec![span("https://example.com", 10.0, 75.0)]);
+        let mut anchors = PageLinkAnchors::new(vec![anchor("https://example.com", 8.0, 79.0)]);
+        anchors.mark_urls_written_out(|_| Some("https://example.com".to_string()));
+
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn a_url_broken_over_two_runs_is_recognised_as_written_out() {
+        // The producer split the URL after a hyphen and hung an annotation on
+        // the whole of it. Decorating either half would sit between the
+        // hyphen and the text that postprocessing rejoins it to.
+        let mut anchors = PageLinkAnchors::new(vec![anchor(
+            "https://docs.microsoft.com/DeployEdge/microsoft-edge-policies",
+            8.0,
+            300.0,
+        )]);
+        anchors.mark_urls_written_out(|_| {
+            Some("https://docs.microsoft.com/DeployEdge/microsoft-edge- policies".to_string())
+        });
+        let line = line(vec![span(
+            "https://docs.microsoft.com/DeployEdge/microsoft-edge-policies",
+            10.0,
+            290.0,
+        )]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "https://docs.microsoft.com/DeployEdge/microsoft-edge-policies"
+        );
+    }
+
+    #[test]
+    fn a_word_that_merely_ends_the_path_stays_a_link() {
+        // "Home" is a fifth of the URL that ends in it: the reader is not
+        // being shown the destination, so the anchor must be wrapped.
+        let mut anchors =
+            PageLinkAnchors::new(vec![anchor("https://example.com/en/Home", 8.0, 30.0)]);
+        anchors.mark_urls_written_out(|_| Some("Home".to_string()));
+        let line = line(vec![span("Home", 10.0, 26.0)]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "[Home](https://example.com/en/Home)"
+        );
+    }
+
+    #[test]
+    fn a_url_shown_shortened_still_becomes_a_link() {
+        let line = line(vec![span("example.com", 10.0, 35.0)]);
+        let anchors = PageLinkAnchors::new(vec![anchor("https://www.example.com/shop", 8.0, 39.0)]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "[example.com](https://www.example.com/shop)"
+        );
+    }
+
+    #[test]
+    fn a_destination_with_brackets_is_wrapped_in_angle_brackets() {
+        let line = line(vec![span("Roma", 10.0, 24.0)]);
+        let anchors = PageLinkAnchors::new(vec![anchor(
+            "https://en.wikipedia.org/wiki/Rome_(city)",
+            8.0,
+            28.0,
+        )]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "[Roma](<https://en.wikipedia.org/wiki/Rome_(city)>)"
+        );
+    }
+
+    #[test]
+    fn a_destination_the_reader_cannot_follow_is_not_written_into_the_markdown() {
+        // `javascript:` is a gesture the viewer performs, not a place; a bare
+        // `#` is a dead in-document jump. The words stay, unwrapped, and the
+        // raw URI is still reported through `MarkdownLink::url`.
+        let line = line(vec![span("Revisiting Models", 10.0, 90.0)]);
+        for url in ["javascript:void(0)", "#", "data:text/html,<b>x</b>"] {
+            let anchors = PageLinkAnchors::new(vec![anchor(url, 8.0, 94.0)]);
+            assert_eq!(
+                line.text_with_formatting_and_links(false, false, false, &anchors),
+                "Revisiting Models",
+                "{url} must not reach the markdown"
+            );
+        }
+        // The schemes a reader can follow still do — including a `/URI` the
+        // producer padded with whitespace, which the destination syntax then
+        // wraps in angle brackets as it wraps any destination with a space.
+        for (url, expected) in [
+            ("https://a.it", "[Revisiting Models](https://a.it)"),
+            ("HTTP://a.it", "[Revisiting Models](HTTP://a.it)"),
+            ("mailto:a@b.it", "[Revisiting Models](mailto:a@b.it)"),
+            ("tel:+3901", "[Revisiting Models](tel:+3901)"),
+            (" https://a.it", "[Revisiting Models](< https://a.it>)"),
+        ] {
+            let anchors = PageLinkAnchors::new(vec![anchor(url, 8.0, 94.0)]);
+            assert_eq!(
+                line.text_with_formatting_and_links(false, false, false, &anchors),
+                expected,
+                "{url} must reach the markdown"
+            );
+        }
+    }
+
+    #[test]
+    fn brackets_in_the_anchor_are_escaped() {
+        let line = line(vec![span("see [3]", 10.0, 35.0)]);
+        let anchors = PageLinkAnchors::new(vec![anchor("https://example.com", 8.0, 39.0)]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "[see \\[3\\]](https://example.com)"
+        );
+    }
+
+    #[test]
+    fn bold_formatting_survives_around_an_anchor() {
+        let mut bold = span("Statista", 10.0, 48.0);
+        bold.is_bold = true;
+        let line = line(vec![bold]);
+        let anchors = PageLinkAnchors::new(vec![anchor("https://statista.com", 8.0, 52.0)]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(true, false, false, &anchors),
+            "**[Statista](https://statista.com)**"
+        );
+    }
+
+    #[test]
+    fn one_rectangle_over_two_runs_is_one_link() {
+        // The producer emitted the anchor as two items. They belong to one
+        // annotation, so they come out as one link, not two.
+        let line = line(vec![span("Jordan", 10.0, 42.0), span("Blake.", 56.0, 28.0)]);
+        let anchors = PageLinkAnchors::new(vec![anchor("https://jordanblake.co.uk", 8.0, 78.0)]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "[Jordan Blake.](https://jordanblake.co.uk)"
+        );
+    }
+
+    #[test]
+    fn a_link_run_ends_where_the_styling_changes() {
+        // One rectangle over "Fonte Statista", the second word bold. The run
+        // is cut at the style boundary so the anchor never has to wrap a
+        // `**` marker it does not own; the destination is repeated instead.
+        let plain = span("Fonte", 10.0, 30.0);
+        let mut bold = span("Statista", 44.0, 48.0);
+        bold.is_bold = true;
+        let line = line(vec![plain, bold]);
+        let anchors = PageLinkAnchors::new(vec![anchor("https://statista.com", 8.0, 86.0)]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(true, false, false, &anchors),
+            "[Fonte](https://statista.com) **[Statista](https://statista.com)**"
+        );
+    }
+
+    #[test]
+    fn a_multibyte_anchor_is_clipped_on_characters_not_bytes() {
+        // "Perché" and "Società" carry two-byte characters. A rectangle over
+        // the second word must cut on characters: a byte offset would land
+        // mid-character and panic.
+        let line = line(vec![span("Perché Società è qui", 10.0, 105.0)]);
+        let anchors = PageLinkAnchors::new(vec![anchor("https://societa.example", 45.0, 40.0)]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "Perché [Società](https://societa.example) è qui"
+        );
+    }
+
+    #[test]
+    fn a_rectangle_claiming_only_punctuation_anchors_nothing() {
+        // The right edge snaps to the start of the next word, so a rectangle
+        // ending just past "org" hands back the full stop that follows it.
+        // `[.](mailto:…)` is noise, not an anchor.
+        let line = line(vec![span("feedback@cisecurity.org . If", 10.0, 140.0)]);
+        let anchors =
+            PageLinkAnchors::new(vec![anchor("mailto:feedback@cisecurity.org", 128.0, 10.0)]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "feedback@cisecurity.org . If"
+        );
+    }
+
+    #[test]
+    fn a_page_without_annotations_renders_exactly_as_before() {
+        let mut bold = span("Statista", 44.0, 48.0);
+        bold.is_bold = true;
+        let line = line(vec![span("Fonte:", 10.0, 32.0), bold]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(true, true, true, &PageLinkAnchors::default()),
+            "Fonte: **Statista**"
+        );
+        assert_eq!(line.text(), "Fonte: Statista");
+    }
+
+    /// A rectangle over the span's full width whose vertical extent covers
+    /// `share` of the 12pt span sitting at y = 100.
+    fn overlapping_anchor(url: &str, share: f32) -> LinkAnchor {
+        LinkAnchor {
+            url: url.to_string(),
+            x: 8.0,
+            y: 100.0,
+            width: 60.0,
+            height: 12.0 * share,
+            writes_out_url: false,
+        }
+    }
+
+    #[test]
+    fn a_span_barely_inside_the_rectangle_is_not_anchored() {
+        // Pins the low side of `ANCHOR_VERTICAL_OVERLAP`: a third of a span
+        // inside the rectangle is the neighbouring line clipped by a
+        // generous `/Rect`, not the line the annotation decorates.
+        let line = line(vec![span("Statista", 10.0, 48.0)]);
+        let anchors = PageLinkAnchors::new(vec![overlapping_anchor("https://statista.com", 0.35)]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "Statista"
+        );
+    }
+
+    #[test]
+    fn a_span_mostly_inside_the_rectangle_is_anchored() {
+        // Pins the high side: a producer draws the rectangle on the glyph
+        // box, not on the font's full ascent, so two thirds of the span
+        // inside it is a match and must not be turned away.
+        let line = line(vec![span("Statista", 10.0, 48.0)]);
+        let anchors = PageLinkAnchors::new(vec![overlapping_anchor("https://statista.com", 0.65)]);
+
+        assert_eq!(
+            line.text_with_formatting_and_links(false, false, false, &anchors),
+            "[Statista](https://statista.com)"
+        );
+    }
+
+    #[test]
+    fn an_anchor_that_is_only_part_of_its_destination_is_not_the_url_written_out() {
+        // The producer broke the URL after the hyphen and hung one annotation
+        // on each visual line. Each half spells most of a plausible URL and
+        // none of them spells this one, so neither may be left for
+        // `format_urls` to linkify into a destination that does not exist.
+        let url =
+            "https://docs.microsoft.com/DeployEdge/microsoft-edge-policies#audiosandboxenabled";
+        assert!(!anchor_repeats_url(
+            "https://docs.microsoft.com/DeployEdge/microsoft-edge-",
+            url
+        ));
+        assert!(!anchor_repeats_url("policies#audiosandboxenabled", url));
+        // The two halves together do spell it, and that is the only shape
+        // that counts as the destination written out.
+        assert!(anchor_repeats_url(
+            "https://docs.microsoft.com/DeployEdge/microsoft-edge- policies#audiosandboxenabled",
+            url
+        ));
+    }
+
+    #[test]
+    fn a_url_is_recognised_as_its_own_anchor_across_a_trailing_slash() {
+        assert!(anchor_repeats_url(
+            "https://example.com",
+            "https://example.com/"
+        ));
+        assert!(anchor_repeats_url(
+            " https://example.com/ ",
+            "https://example.com"
+        ));
+        assert!(!anchor_repeats_url("example", "https://www.example.com"));
+    }
+
+    #[test]
+    fn a_mailto_shown_without_its_scheme_is_not_its_own_anchor() {
+        // The address covers most of the destination but the scheme is never
+        // visible, so leaving it plain would drop the destination.
+        assert!(!anchor_repeats_url(
+            "info@example.com",
+            "mailto:info@example.com"
+        ));
     }
 }

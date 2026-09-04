@@ -185,6 +185,35 @@ class PageRegionTexts:
     """0-indexed page number."""
     regions: list[RegionText]
 
+class MarkdownLink:
+    """A hyperlink annotation and the anchor text it was attached to."""
+    url: str
+    """Destination URI."""
+    rect: tuple[float, float, float, float]
+    """The annotation's rectangle as (x, y, width, height), y the bottom edge
+    growing upward, in the same coordinate frame as TextItem."""
+    page: int
+    """1-indexed page carrying the annotation."""
+    anchor: Optional[str]
+    """The text under the rectangle, when there is any. Present whenever
+    extraction found words there, which is not the same as those words reaching
+    the output: see ``anchored_inline``."""
+    anchored_inline: bool
+    """True when the anchor text was found on a line or in a table cell handed
+    to the markdown renderer, which normally means the link is in the output as
+    ``[anchor](url)``. It does not promise the line survived: one the renderer
+    then drops (an empty line, a suppressed table of contents) leaves this True
+    with no visible link.
+
+    False says only that no line or cell carried it, not that no text sat under
+    the rectangle — ``anchor`` is often set alongside it, for a folio, a
+    stripped running header, or a cell whose joined text the anchor could not be
+    located in. Those destinations are what the page's
+    ``**Links on this page**`` list exists for, and that list is not exhaustive
+    either: it leaves out a destination already anchored elsewhere on the page,
+    and one whose scheme the markdown does not carry (``javascript:``, a bare
+    ``#``). ``url`` is the complete record."""
+
 class PageMarkdown:
     """Per-page markdown extraction result."""
     page: int
@@ -195,6 +224,11 @@ class PageMarkdown:
     """True when text on this page is unreliable and OCR should be used instead."""
     ocr_reason: Optional[str]
     """Machine-readable OCR reason when the cause is known."""
+    links: list[MarkdownLink]
+    """Every /Link /URI annotation on this page, reported even when the page is
+    routed to OCR and `markdown` comes back empty: a link rectangle is exact
+    data read from the file. A page whose text failed the quality check reports
+    its annotations with `anchor` set to None."""
 
 class PagesExtractionResult:
     """Per-page markdown output with document-wide layout classification."""

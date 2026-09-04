@@ -409,22 +409,6 @@ fn format_urls(text: &str) -> String {
         let start = mat.start();
         let url = mat.as_str();
 
-        // Check if this URL is already in a markdown link by looking at preceding chars
-        // Use safe character boundary checking for multi-byte UTF-8
-        let before = {
-            let mut check_start = start.saturating_sub(2);
-            // Find a valid character boundary
-            while check_start > 0 && !text.is_char_boundary(check_start) {
-                check_start -= 1;
-            }
-            if check_start < start && text.is_char_boundary(start) {
-                &text[check_start..start]
-            } else {
-                ""
-            }
-        };
-        let already_linked = before.ends_with("](") || before.ends_with("](");
-
         // Also check if it's inside square brackets (link text)
         // Ensure we're slicing at a valid char boundary
         let prefix = if text.is_char_boundary(start) {
@@ -437,6 +421,14 @@ fn format_urls(text: &str) -> String {
             }
             &text[..safe_start]
         };
+        // A URL opened by `<` is already a destination: either the autolink
+        // `<https://…>` the per-page hyperlink list emits, or the
+        // `](<https://…>)` form a destination carrying a parenthesis or a
+        // space takes. Linkifying inside either nests a link in a link, and
+        // for the bracketed forms it also truncates the destination at the
+        // parenthesis the URL regex stops on.
+        let already_linked = prefix.ends_with("](") || prefix.ends_with('<');
+
         let open_brackets = prefix.matches('[').count();
         let close_brackets = prefix.matches(']').count();
         let inside_link_text = open_brackets > close_brackets;
@@ -920,6 +912,21 @@ mod tests {
     fn test_format_urls_bare_url() {
         let result = format_urls("Visit https://example.com for info");
         assert!(result.contains("[https://example.com](https://example.com)"));
+    }
+
+    #[test]
+    fn format_urls_leaves_an_angle_bracket_destination_alone() {
+        // A destination carrying a parenthesis is written `](<…>)`; the URL
+        // regex stops at that parenthesis, so without the guard it would be
+        // linkified inside its own destination and corrupted.
+        let input = "[Roma](<https://en.wikipedia.org/wiki/Rome_(city)>)";
+        assert_eq!(format_urls(input), input);
+    }
+
+    #[test]
+    fn format_urls_leaves_an_autolink_alone() {
+        let input = "- <https://example.com/a_(b)>";
+        assert_eq!(format_urls(input), input);
     }
 
     #[test]
