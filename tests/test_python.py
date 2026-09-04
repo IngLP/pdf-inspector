@@ -1061,6 +1061,13 @@ class TestTextPaint:
             assert item.render_mode in range(8)
 
 
+class TestMarkdownLinks:
+    def test_uri_annotation_reaches_document_markdown(self):
+        result = pdf_inspector.process_pdf_bytes(paint_pdf())
+        assert result.markdown is not None
+        assert "- <https://example.com/report>" in result.markdown.splitlines()
+
+
 class TestDocumentInformation:
     def test_information_entries_are_decoded(self):
         result = pdf_inspector.process_pdf_bytes(paint_pdf())

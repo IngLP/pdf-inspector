@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 use crate::structure_tree::StructRole;
-use crate::types::TextLine;
+use crate::types::{PageLinkAnchors, TextLine};
 
 use super::analysis::{
     bold_heading_level, calculate_font_stats, compute_heading_tiers, compute_paragraph_threshold,
@@ -708,8 +708,47 @@ fn count_table_columns(table_md: &str) -> usize {
     0
 }
 
-/// Flush any remaining tables and images for a given page
+/// What a page has already contributed to the output, so nothing is emitted
+/// twice as the line loop and the end-of-page flush both reach for it.
+#[derive(Default)]
+struct EmittedBlocks {
+    tables: HashSet<(u32, usize)>,
+    images: HashSet<(u32, usize)>,
+    link_lists: HashSet<u32>,
+}
+
+/// Close out a page: emit whatever tables and images its lines did not reach,
+/// then the list of links that found no text to anchor to.
 fn flush_page_tables_and_images(
+    page: u32,
+    page_blocks: &HashMap<u32, Vec<PositionedBlockRef<'_>>>,
+    emitted: &mut EmittedBlocks,
+    page_link_lists: &HashMap<u32, String>,
+    output: &mut String,
+    in_paragraph: &mut bool,
+) {
+    flush_page_blocks(
+        page,
+        page_blocks,
+        &mut emitted.tables,
+        &mut emitted.images,
+        output,
+        in_paragraph,
+    );
+    if let Some(list) = page_link_lists.get(&page) {
+        if emitted.link_lists.insert(page) {
+            if *in_paragraph {
+                output.push_str("\n\n");
+                *in_paragraph = false;
+            }
+            output.push('\n');
+            output.push_str(list);
+        }
+    }
+}
+
+/// Flush any remaining tables and images for a given page
+fn flush_page_blocks(
     page: u32,
     page_blocks: &HashMap<u32, Vec<PositionedBlockRef<'_>>>,
     inserted_tables: &mut HashSet<(u32, usize)>,
@@ -746,7 +785,19 @@ fn flush_page_tables_and_images(
     }
 }
 
+/// Everything hyperlink anchoring contributes to page rendering: the
+/// annotations each line's items are matched against, and the foot-of-page
+/// list of the links that matched none.
+pub(super) struct PageLinks<'a> {
+    pub(super) anchors: &'a HashMap<u32, PageLinkAnchors>,
+    pub(super) page_lists: &'a HashMap<u32, String>,
+}
+
+// One parameter over the lint's budget, which this signature already sat at
+// before hyperlinks. Its arguments are the independent page-level streams the
+// renderer weaves together; bundling unrelated ones would hide that.
 /// Convert text lines to markdown, inserting tables and images at appropriate Y positions
+#[allow(clippy::too_many_arguments)]
 pub(super) fn to_markdown_from_lines_with_tables_and_images(
     lines: Vec<TextLine>,
     options: MarkdownOptions,
@@ -757,9 +808,23 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     struct_roles: Option<
         &std::collections::HashMap<u32, std::collections::HashMap<i64, StructRole>>,
     >,
+    links: PageLinks<'_>,
 ) -> String {
+    let PageLinks {
+        anchors: link_anchors,
+        page_lists: page_link_lists,
+    } = links;
     if lines.is_empty() && page_tables.is_empty() && page_images.is_empty() {
-        return String::new();
+        let mut only_links = String::new();
+        for page in page_link_lists
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<u32>>()
+        {
+            only_links.push('\n');
+            only_links.push_str(&page_link_lists[&page]);
+        }
+        return only_links;
     }
 
     // Calculate font statistics
@@ -865,13 +930,14 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     let mut prev_had_dot_leaders = false;
     let mut paragraph_in_wrapped_bold_run = false;
     let mut toc_suppress_page: Option<u32> = None;
-    let mut inserted_tables: HashSet<(u32, usize)> = HashSet::new();
-    let mut inserted_images: HashSet<(u32, usize)> = HashSet::new();
+    let mut emitted = EmittedBlocks::default();
 
-    // Collect all pages that have tables or images (including image-only pages)
+    // Collect all pages that have tables, images or a link list — anything
+    // that must still be flushed on a page whose text lines have run out.
     let mut all_content_pages: Vec<u32> = page_tables
         .keys()
         .chain(page_images.keys())
+        .chain(page_link_lists.keys())
         .copied()
         .collect();
     all_content_pages.sort();
@@ -901,8 +967,8 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 flush_page_tables_and_images(
                     current_page,
                     &page_blocks,
-                    &mut inserted_tables,
-                    &mut inserted_images,
+                    &mut emitted,
+                    page_link_lists,
                     &mut output,
                     &mut in_paragraph,
                 );
@@ -925,8 +991,8 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 flush_page_tables_and_images(
                     p,
                     &page_blocks,
-                    &mut inserted_tables,
-                    &mut inserted_images,
+                    &mut emitted,
+                    page_link_lists,
                     &mut output,
                     &mut in_paragraph,
                 );
@@ -953,8 +1019,8 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         if let Some(blocks) = page_blocks.get(&current_page) {
             for &(kind, idx, block) in blocks {
                 let already_inserted = match kind {
-                    PositionedBlockKind::Table => inserted_tables.contains(&(current_page, idx)),
-                    PositionedBlockKind::Image => inserted_images.contains(&(current_page, idx)),
+                    PositionedBlockKind::Table => emitted.tables.contains(&(current_page, idx)),
+                    PositionedBlockKind::Image => emitted.images.contains(&(current_page, idx)),
                 };
                 if positioned_block_precedes_line(block, line) && !already_inserted {
                     // Code lines buffer until their block closes; flush them
@@ -975,10 +1041,10 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                     output.push('\n');
                     match kind {
                         PositionedBlockKind::Table => {
-                            inserted_tables.insert((current_page, idx));
+                            emitted.tables.insert((current_page, idx));
                         }
                         PositionedBlockKind::Image => {
-                            inserted_images.insert((current_page, idx));
+                            emitted.images.insert((current_page, idx));
                         }
                     }
                 }
@@ -1016,11 +1082,15 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         prev_y = line.y;
         prev_x = line_x;
 
-        // Get text with optional bold/italic formatting
-        let text = line.text_with_formatting(
+        // Get text with optional bold/italic formatting, and with the
+        // hyperlink anchors of this page spliced in.
+        let no_anchors = PageLinkAnchors::default();
+        let anchors = link_anchors.get(&line.page).unwrap_or(&no_anchors);
+        let text = line.text_with_formatting_and_links(
             options.detect_bold,
             options.detect_italic,
             options.detect_underline,
+            anchors,
         );
         let trimmed = text.trim();
 
@@ -1205,11 +1275,12 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             let prefix = "#".repeat(level);
             // Plain text for headers (no redundant bold/italic inside `#`),
             // but underline is preserved: `<u>` carries meaning `#` doesn't.
-            let heading_text = if options.detect_underline {
-                line.text_with_formatting(false, false, true)
-            } else {
-                plain_text.clone()
-            };
+            let heading_text = line.text_with_formatting_and_links(
+                false,
+                false,
+                options.detect_underline,
+                anchors,
+            );
             output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
             if is_toc_marker_heading(plain_trimmed) {
                 toc_suppress_page = Some(line.page);
@@ -1341,8 +1412,8 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
     flush_page_tables_and_images(
         current_page,
         &page_blocks,
-        &mut inserted_tables,
-        &mut inserted_images,
+        &mut emitted,
+        page_link_lists,
         &mut output,
         &mut in_paragraph,
     );
@@ -1353,8 +1424,8 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         flush_page_tables_and_images(
             p,
             &page_blocks,
-            &mut inserted_tables,
-            &mut inserted_images,
+            &mut emitted,
+            page_link_lists,
             &mut output,
             &mut in_paragraph,
         );
@@ -1720,6 +1791,18 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
 
 #[cfg(test)]
 mod tests {
+    use once_cell::sync::Lazy;
+
+    static NO_LINK_ANCHORS: Lazy<HashMap<u32, PageLinkAnchors>> = Lazy::new(HashMap::new);
+    static NO_LINK_LISTS: Lazy<HashMap<u32, String>> = Lazy::new(HashMap::new);
+
+    /// Rendering input for a document without hyperlink annotations.
+    fn no_links() -> PageLinks<'static> {
+        PageLinks {
+            anchors: &NO_LINK_ANCHORS,
+            page_lists: &NO_LINK_LISTS,
+        }
+    }
 
     #[test]
     fn section_number_prefix_detection() {
@@ -1851,6 +1934,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::from([1]),
             None,
+            no_links(),
         );
         let positions = [
             "Left column upper prose.",
@@ -1927,6 +2011,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
+            no_links(),
         );
 
         assert!(
@@ -1956,6 +2041,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
+            no_links(),
         );
 
         assert!(
@@ -1998,6 +2084,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
+            no_links(),
         );
 
         assert!(
@@ -2035,6 +2122,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
+            no_links(),
         );
 
         assert!(
@@ -2071,6 +2159,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
+            no_links(),
         );
 
         assert!(md.contains("# Title"), "H1 → #: {md}");
@@ -2101,6 +2190,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             None,
+            no_links(),
         );
 
         assert!(
@@ -2143,6 +2233,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
+            no_links(),
         );
 
         assert!(
@@ -2192,6 +2283,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             None,
+            no_links(),
         );
 
         // The bold heading should be detected
@@ -2294,6 +2386,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             None,
+            no_links(),
         );
 
         assert!(
@@ -2363,6 +2456,7 @@ mod tests {
                             &HashMap::new(),
                             &HashSet::new(),
                             None,
+                            no_links(),
                         ),
                     ];
                     for md in outputs {
@@ -2439,6 +2533,7 @@ mod tests {
                         &HashMap::new(),
                         &HashSet::new(),
                         None,
+                        no_links(),
                     ),
                 ];
                 for md in outputs {
@@ -2519,6 +2614,7 @@ mod tests {
                 &HashMap::new(),
                 &HashSet::new(),
                 None,
+                no_links(),
             );
             assert!(
                 md.lines()
@@ -2535,6 +2631,7 @@ mod tests {
             &HashMap::new(),
             &HashSet::new(),
             Some(&roles),
+            no_links(),
         );
         assert!(md.contains("## “Every member"), "{md}");
         assert!(md.contains("## so that anyone"), "{md}");
@@ -2570,6 +2667,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             Some(&roles),
+            no_links(),
         );
 
         // Should produce a single fenced block, not three separate ones
@@ -2710,6 +2808,7 @@ mod tests {
             &HashMap::new(),
             &std::collections::HashSet::new(),
             None,
+            no_links(),
         );
 
         assert!(

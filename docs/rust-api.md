@@ -583,6 +583,7 @@ Low-level detection functions are also available via the `detector` module (`det
 | `BoldSource` | Where `TextItem::is_bold` came from: `FontName`, `FontFlags`, `WeightClass` (with `bold_from_weight`) or `Painted`; the first of them in that order when more than one says bold |
 | `StructureElement` | Tagged-PDF structure reference: page (1-indexed), mcid, role (`"H1"`..`"H6"`, `"P"`, …) |
 | `MarkdownOptions` | Configuration for Markdown formatting (page numbers, etc.) |
-| `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr |
+| `PageMarkdown` | Per-page result: page (0-indexed), markdown, needs_ocr, links |
+| `MarkdownLink` | One `/Link /URI` annotation: url, rect, page, anchor, anchored_inline |
 | `PagesExtractionResult` | Per-page output + 1-indexed pages_with_tables / pages_with_columns / pages_needing_ocr, is_complex |
 | `PdfError` | `Io`, `Parse`, `Encrypted`, `InvalidStructure`, `NotAPdf` |

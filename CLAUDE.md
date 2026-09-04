@@ -46,6 +46,7 @@ src/
     classify.rs                 – line classification (header, list, code, caption)
     preprocess.rs               – drop cap merging, heading line merging
     postprocess.rs              – dot leaders, hyphenation, page numbers, URL formatting
+    links.rs                    – /Link /URI anchoring: rectangles to text, per-page link list
 ```
 
 ## Key design decisions
