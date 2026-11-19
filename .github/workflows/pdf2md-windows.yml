@@ -41,6 +41,8 @@ jobs:
           Copy-Item -LiteralPath 'packaging/windows/pdf2md.cmd', 'packaging/windows/aggiungi-al-path.cmd', 'packaging/windows/LEGGIMI.txt' -Destination $bundle
           Copy-Item -LiteralPath packaging/windows/bin/pausa-se-da-esplora.cmd -Destination $bin
           Copy-Item target/release/pdf2md.exe -Destination $bin
+          rustc --edition 2021 -C opt-level=s -C strip=symbols packaging/windows/staging.rs -o (Join-Path $bin 'pdf2md-staging.exe')
+          if ($LASTEXITCODE -ne 0) { throw 'The Windows staging utility did not compile' }
           Copy-Item LICENSE -Destination "$bundle/licenze/pdf-inspector.txt"
           Copy-Item external/bcmaps/LICENSE -Destination "$bundle/licenze/Adobe CMaps.txt"
 
@@ -194,23 +196,32 @@ jobs:
           }
           $output = [IO.Path]::ChangeExtension($pdf, '.md')
           $expected = Join-Path $env:PDF2MD_TEST_DIR 'terminale-expected.md'
-          & "$env:PDF2MD_EXTRACTED/bin/pdf2md.exe" --ocr auto --ocr-offline $pdf $expected 2>$null
+          & "$env:PDF2MD_EXTRACTED/bin/pdf2md.exe" --ocr auto --ocr-offline --pages $pdf $expected 2>$null
           if ($LASTEXITCODE -ne 0 -or (Get-FileHash $output).Hash -ne (Get-FileHash $expected).Hash) {
               throw 'Raw Markdown differs from the native PDF reference'
           }
           $markdown = [Text.UTF8Encoding]::new($false, $true).GetString([IO.File]::ReadAllBytes($output))
-          if ($markdown -notmatch 'Freon' -or @(Get-ChildItem $env:PDF2MD_TEST_DIR -Directory -Force -Filter '.pdf2md-*').Count -ne 0) {
+          $pages = [regex]::Matches($markdown, '(?m)^<!-- Page ([0-9]+) -->\r?$')
+          if ($pages.Count -ne 3) {
+              throw 'Expected page markers 1, 2, 3 in terminal output'
+          }
+          if ($markdown -notmatch 'Freon') {
               throw 'Expected UTF-8 document Markdown without CLI diagnostics'
           }
+
+      - name: 'Prova: conversione con appoggio sorvegliato'
+        timeout-minutes: 4
+        run: ./packaging/windows/tests/watch-staging.ps1
 
       - name: 'Prova: percorso con spazi e accenti'
         run: |
           $dir = Join-Path $env:PDF2MD_TEST_DIR 'Documenti di prova'
           $null = New-Item -ItemType Directory -Path $dir
-          $pdf = Join-Path $dir 'relazione è.pdf'
+          $pdf = Join-Path $dir 'relazione è & nota (1)!.pdf'
+          $output = [IO.Path]::ChangeExtension($pdf, '.md')
           Copy-Item tests/fixtures/thermo-freon12.pdf -Destination $pdf
           & "$env:PDF2MD_EXTRACTED/pdf2md.cmd" $pdf
-          if ($LASTEXITCODE -ne 0 -or (Get-Content -LiteralPath "$dir/relazione è.md" -Raw) -notmatch 'Freon') {
+          if ($LASTEXITCODE -ne 0 -or (Get-Content -LiteralPath $output -Raw) -notmatch 'Freon') {
               throw 'Conversion failed for a path with spaces and accents'
           }
 
@@ -268,7 +279,6 @@ jobs:
               (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($missing, '.md'))) -or
               (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($bad, '.md'))) -or
               (Get-Content -LiteralPath $previous) -cne 'Testo da conservare' -or
-              @(Get-ChildItem $env:PDF2MD_TEST_DIR -Recurse -Directory -Force -Filter '.pdf2md-*').Count -ne 0 -or
               (Get-Content -LiteralPath ([IO.Path]::ChangeExtension($good, '.md')) -Raw) -notmatch 'Freon') {
               throw "Expected named errors, continued conversion, and aggregate failure: $messages"
           }
@@ -318,9 +328,6 @@ jobs:
               } elseif ($result -eq 0 -or (Get-FileHash -LiteralPath $output).Hash -cne $before) {
                   throw "Executable exit $code must preserve Markdown and fail the launcher"
               }
-              if (@(Get-ChildItem -LiteralPath $test -Directory -Force -Filter '.pdf2md-*').Count -ne 0) {
-                  throw "Staging remained after executable exit $code"
-              }
               Write-Host "Executable exit $code, launcher exit $result"
           }
 
@@ -364,9 +371,11 @@ jobs:
           [IO.File]::WriteAllText($pdf, $contents, [Text.Encoding]::ASCII)
           $messages = & "$env:PDF2MD_EXTRACTED/pdf2md.cmd" $pdf 2>&1
           $output = [IO.Path]::ChangeExtension($pdf, '.md')
-          if ($LASTEXITCODE -ne 0 -or ($messages -join "`n") -cnotmatch '(?m)^Nessun testo trovato nel PDF\.\r?$' -or
-              !(Test-Path -LiteralPath $output -PathType Leaf) -or (Get-Item -LiteralPath $output).Length -ne 0) {
-              throw "Expected an empty Markdown file and a successful conversion: $messages"
+          if ($LASTEXITCODE -ne 0 -or ($messages -join "`n") -cnotmatch '(?m)^Scritto: "' -or
+              !(Test-Path -LiteralPath $output -PathType Leaf) -or
+              (Get-Content -LiteralPath $output -Raw).Trim() -cne '<!-- Page 1 -->' -or
+              ($messages -join "`n") -cnotmatch '(?m)^Nessun testo trovato nel PDF\.\r?$') {
+              throw "Expected only the blank page marker and a successful conversion: $messages"
           }
 
       - name: 'Prova: scansione senza rete'
@@ -404,7 +413,7 @@ jobs:
               $env:ORT_DYLIB_PATH = Join-Path $env:PDF2MD_EXTRACTED 'bin\onnxruntime.dll'
               $models = Join-Path $env:PDF2MD_EXTRACTED 'models\pp-ocrv6-small'
               $expected = Join-Path $env:PDF2MD_TEST_DIR 'scansione-expected.md'
-              & $exe --ocr auto --ocr-offline --ocr-model-dir $models $pdf $expected 2>$null
+              & $exe --ocr auto --ocr-offline --ocr-model-dir $models --pages $pdf $expected 2>$null
               if ($LASTEXITCODE -ne 0 -or (Get-FileHash $output).Hash -ne (Get-FileHash $expected).Hash) {
                   throw 'Raw Markdown differs from the OCR reference'
               }
@@ -441,7 +450,8 @@ jobs:
           & "$env:PDF2MD_EXTRACTED/pdf2md.cmd" $pdf
           if ($LASTEXITCODE -ne 0) { throw 'A4 conversion failed' }
           $markdown = Get-Content -LiteralPath ([IO.Path]::ChangeExtension($pdf, '.md')) -Raw
-          $tokens = $markdown -split '[^a-zA-Z0-9.]+'
+          $body = $markdown -creplace '(?m)^<!-- Page [0-9]+ -->\r?$', ''
+          $tokens = $body -split '[^a-zA-Z0-9.]+'
           foreach ($number in '21', '22', '23', '91', '92', '93') {
               if ($number -notin $tokens) { throw "A4 body number $number was lost" }
           }
@@ -515,6 +525,63 @@ jobs:
           & cmd.exe /d /c 'pdf2md dal-path.pdf'
           if ($LASTEXITCODE -ne 0 -or (Get-Content -LiteralPath 'dal-path.md' -Raw) -notmatch 'Freon') {
               throw 'The PATH command failed to write Markdown'
+          }
+
+      - name: 'Prova: tabella a cavallo di pagina'
+        run: |
+          $env:PDF2MD_TABLE_FIXTURE = (Resolve-Path -LiteralPath tests/support/table_pages.rs).Path
+          $source = Join-Path $env:PDF2MD_TEST_DIR 'make_table.rs'
+          $builder = Join-Path $env:PDF2MD_TEST_DIR 'make_table.exe'
+          $pdf = Join-Path $env:PDF2MD_TEST_DIR 'tabella.pdf'
+          @'
+          include!(env!("PDF2MD_TABLE_FIXTURE"));
+          fn main() { std::fs::write(std::env::args_os().nth(1).unwrap(), repeated_header_pdf()).unwrap(); }
+          '@ | Set-Content -LiteralPath $source -Encoding utf8
+          rustc --edition 2021 $source -o $builder
+          if ($LASTEXITCODE -ne 0) { throw 'Table fixture builder did not compile' }
+          & $builder $pdf
+          if ($LASTEXITCODE -ne 0) { throw 'Table fixture generation failed' }
+          & "$env:PDF2MD_EXTRACTED/pdf2md.cmd" $pdf
+          if ($LASTEXITCODE -ne 0) { throw 'Table fixture conversion failed' }
+
+          $markdown = Get-Content -LiteralPath ([IO.Path]::ChangeExtension($pdf, '.md')) -Raw
+          $headers = [regex]::Matches($markdown, '(?m)^\|Region\|Amount\|Status\|\r?$').Count
+          $lastRow = $markdown.IndexOf('|Eastern region|102|Reviewed and approved|', [StringComparison]::Ordinal)
+          $pageTwo = $markdown.IndexOf('<!-- Page 2 -->', [StringComparison]::Ordinal)
+          $afterTable = $markdown.IndexOf('This paragraph follows', [StringComparison]::Ordinal)
+          if ($headers -ne 1 -or $lastRow -lt 0 -or $pageTwo -le $lastRow -or $afterTable -le $pageTwo) {
+              throw "Expected one table ending before page 2 (headers: $headers, final row: $lastRow, marker: $pageTwo, following text: $afterTable)"
+          }
+
+      - name: 'Prova: segni di pagina nei Markdown'
+        run: |
+          # Physical page counts of the source PDFs used by the conversion steps.
+          $fixtures = [ordered]@{
+              'terminale.md' = 3
+              'Documenti di prova/relazione è & nota (1)!.md' = 3
+              'altri PDF/successivo.md' = 3
+              'bianco.md' = 1
+              'scansione.md' = 1
+              'a4.md' = 3
+              'dal-path.md' = 3
+              'tabella.md' = 2
+          }
+          foreach ($fixture in $fixtures.GetEnumerator()) {
+              $path = Join-Path $env:PDF2MD_TEST_DIR $fixture.Key
+              $markdown = Get-Content -LiteralPath $path -Raw
+              $markers = [regex]::Matches($markdown, '(?m)^<!-- Page ([0-9]+) -->\r?$')
+              $numbers = ($markers | ForEach-Object { $_.Groups[1].Value }) -join ','
+              $expected = (1..$fixture.Value) -join ','
+              if ($numbers -cne $expected) {
+                  throw "Expected page markers [$expected] in $($fixture.Key); found [$numbers]"
+              }
+          }
+
+      - name: 'Prova: nessun appoggio residuo'
+        run: |
+          $residue = @(Get-ChildItem -LiteralPath $env:PDF2MD_TEST_DIR -Recurse -Force -Filter '.pdf2md-*')
+          if ($residue.Count -ne 0) {
+              throw "Staging remained: $($residue.FullName -join ', ')"
           }
 
       - name: Upload the ZIP and SHA-256

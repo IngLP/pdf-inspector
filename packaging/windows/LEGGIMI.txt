@@ -23,6 +23,8 @@ era aperto, e aprine uno nuovo. Puoi scrivere:
     pdf2md "C:\Documenti di prova\relazione è.pdf"
 
 COSA ASPETTARSI
+Nel file .md una riga nascosta nell'anteprima, come «<!-- Page 2 -->»,
+indica dove inizia la seconda pagina del PDF.
 Il programma estrae direttamente il testo già presente nel PDF. Per le
 pagine scansionate riconosce il testo sul tuo PC, anche senza connessione.
 Una scansione nitida dà risultati migliori. Per tabelle e formule scansionate
