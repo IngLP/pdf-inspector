@@ -1664,21 +1664,8 @@ fn convert_items_with_rects_lines_and_table_output(
     let mut table_items: HashSet<usize> = HashSet::new();
     // Hyperlink anchoring needs the annotations before table detection: a
     // table claims its items, so a cell must carry the anchor itself.
-    let mut link_anchors = links::anchors_by_page(&link_items);
+    let link_anchors = links::anchors_by_page(&link_items);
     let link_anchor_texts = links::anchor_texts(text_items.iter(), &link_anchors);
-    // An annotation whose whole anchor spells its own URL is left undecorated
-    // wherever it renders: `format_urls` links a bare URL already, and the
-    // brackets would sit between a line-break hyphen and the halves that
-    // postprocessing rejoins. That hand-off is only safe while `format_urls`
-    // is on; with it off nothing would pick the bare URL up, and the
-    // destination would reach neither the text nor the page's link list, which
-    // skips the annotation as anchored.
-    if options.format_urls {
-        for (page, anchors) in link_anchors.iter_mut() {
-            anchors.mark_urls_written_out(|index| link_anchor_texts.get(&(*page, index)).cloned());
-        }
-    }
-    let link_anchors = link_anchors;
     let mut table_output =
         TableDetectionOutput::new(table_output_mode, &link_anchors, &link_anchor_texts);
 

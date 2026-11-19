@@ -20,11 +20,11 @@ version and date. Earlier releases are described in their
   hangs a separate annotation on each name still gets three correct anchors.
   Anchors inside a detected table's cells are wrapped too. A rectangle whose
   claim on a span is punctuation alone (`[.](mailto:…)`, the comma between two
-  linked names) anchors nothing. Text that spells its destination *in full* is
-  left alone for `format_urls` — but only while `format_urls` is on, and only
-  when it really is the whole destination: a URL the producer broke over two
-  lines and hung one annotation on each half is anchored, so the destination
-  survives instead of `format_urls` linkifying a URL truncated at the break.
+  linked names) anchors nothing. Prose and table cells use the annotation URI
+  even when the visible text already spells the URL. Bold and italic
+  delimiters stay outside links, including around bare URLs.
+  A visible URL wrapped across two lines by one annotation becomes one link.
+  When each half has its own annotation, each keeps its own link.
   `format_urls` no longer linkifies inside a destination a `<` has opened —
   the `<https://…>` autolink of the page list, and the `](<https://…>)` form a
   destination carrying a parenthesis or a space takes.
