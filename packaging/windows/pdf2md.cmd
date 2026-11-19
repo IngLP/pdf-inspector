@@ -59,10 +59,26 @@ set "staging_without_text=1"
 :publish
 set "overwrite="
 if exist "%output%" set "overwrite=1"
-move /y "%staging%" "%output%" >nul || goto cleanup_failed
+set "publish_retries=0"
+
+:publish_move
+move /y "%staging%" "%output%" >nul 2>&1 || goto retry_publish
 if defined overwrite (echo Sovrascritto: "%output%") else (echo Scritto: "%output%")
 if defined staging_without_text echo Nessun testo trovato nel PDF.
 goto advance
+
+:retry_publish
+if %publish_retries% GEQ 3 goto publish_failed
+set /a publish_retries+=1 >nul
+"%staging_helper%" wait-to-retry >nul 2>&1
+if not errorlevel 0 goto staging_helper_failed
+if errorlevel 1 goto staging_helper_failed
+goto publish_move
+
+:publish_failed
+if exist "%staging%" del /q "%staging%" >nul 2>&1
+"%staging_helper%" report-replace-failure "%output%"
+goto mark_failed
 
 :staging_read_failed
 if exist "%staging%" del /q "%staging%" 2>nul

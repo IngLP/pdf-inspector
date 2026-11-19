@@ -31,6 +31,7 @@ Una scansione nitida dà risultati migliori. Per tabelle e formule scansionate
 controlla il PDF originale: struttura e simboli possono andare persi.
 
 IN CASO DI ERRORE
+Se il file .md è aperto in un altro programma, chiudilo e riprova.
 Controlla che il PDF si apra nel tuo lettore e che tu possa scrivere nella
 cartella del PDF. Se hai aperto il programma nello ZIP, estrai prima tutti
 i file. Se il problema continua, conserva il messaggio mostrato nella
