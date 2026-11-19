@@ -11362,6 +11362,187 @@ fn make_linked_page_pdf() -> Vec<u8> {
     pdf
 }
 
+fn make_pdf_with_uri_annotations(
+    font: &str,
+    contents: String,
+    annotations: &[([i32; 4], &str)],
+) -> Vec<u8> {
+    use lopdf::{dictionary, Document, Object, Stream};
+
+    let mut pdf = Document::with_version("1.4");
+    let pages = pdf.new_object_id();
+    let font = pdf.add_object(dictionary! {
+        "Type" => "Font", "Subtype" => "Type1", "BaseFont" => Object::Name(font.as_bytes().to_vec()),
+    });
+    let annots = annotations
+        .iter()
+        .map(|(rect, destination)| {
+            let id = pdf.add_object(dictionary! {
+                "Type" => "Annot", "Subtype" => "Link",
+                "Rect" => rect.iter().map(|coordinate| Object::from(*coordinate)).collect::<Vec<_>>(),
+                "A" => dictionary! { "S" => "URI", "URI" => Object::string_literal(*destination) },
+            });
+            Object::Reference(id)
+        })
+        .collect::<Vec<_>>();
+    let contents = pdf.add_object(Stream::new(dictionary! {}, contents.into_bytes()));
+    let page = pdf.add_object(dictionary! {
+        "Type" => "Page", "Parent" => pages, "Contents" => contents,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font } },
+        "Annots" => annots,
+    });
+    pdf.objects.insert(
+        pages,
+        dictionary! {
+            "Type" => "Pages", "Kids" => vec![Object::Reference(page)], "Count" => 1,
+        }
+        .into(),
+    );
+    let catalog = pdf.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+    pdf.trailer.set("Root", catalog);
+    let mut bytes = Vec::new();
+    pdf.save_to(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn annotated_urls_keep_their_destination_inside_and_outside_emphasis() {
+    let url = "https://example.com/report";
+    // Keep prose styling visible rather than promoting the short lines to headings.
+    let options = PdfOptions::new().markdown(MarkdownOptions {
+        detect_headers: false,
+        ..MarkdownOptions::default()
+    });
+    let mut mismatches = Vec::new();
+    for (font, emphasis, destination) in [
+        ("Helvetica", "", "https://example.com/report/"),
+        ("Helvetica-Bold", "**", url),
+        ("Helvetica-Oblique", "*", url),
+        ("Helvetica-BoldOblique", "***", url),
+    ] {
+        let contents = format!(
+            "BT /F1 12 Tf 72 700 Td (Website:) Tj 1 0 0 1 128 700 Tm ({url}) Tj \
+             1 0 0 1 72 650 Tm (This report describes the results available to its readers.) Tj ET"
+        );
+        let bytes =
+            make_pdf_with_uri_annotations(font, contents, &[([128, 690, 305, 715], destination)]);
+        let markdown = process_pdf_mem_with_options(&bytes, options.clone())
+            .unwrap()
+            .markdown
+            .expect("native Markdown");
+        let expected = format!("{emphasis}Website: [{url}]({destination}){emphasis}");
+        let actual = markdown.lines().next().unwrap();
+        if actual != expected {
+            mismatches.push(format!("{font}: expected {expected:?}, got {actual:?}"));
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+#[test]
+fn annotated_url_across_two_lines_is_joined_only_for_the_same_annotation() {
+    let options = PdfOptions::new().markdown(MarkdownOptions {
+        detect_headers: false,
+        ..MarkdownOptions::default()
+    });
+    for (first, second) in [
+        ("https://example.com/Deploy-", "Edge/guide"),
+        ("https://example.com/Deploy-", "edge/guide"),
+        ("https://[2001:db8::1]/Deploy-", "Edge/guide"),
+    ] {
+        let destination = format!("{first}{second}");
+        let label = destination.replace('[', "\\[").replace(']', "\\]");
+        let first_label = first.replace('[', "\\[").replace(']', "\\]");
+        let contents = format!(
+            "BT /F1 12 Tf 72 690 Td ({first}) Tj 0 -15 Td ({second}) Tj \
+             0 -45 Td (This report presents the findings of the regional survey.) Tj \
+             0 -30 Td (The archive includes a separate record for these regional results.) Tj ET"
+        );
+
+        for font in ["Helvetica", "Helvetica-Bold"] {
+            let pdf = make_pdf_with_uri_annotations(
+                font,
+                contents.clone(),
+                &[([71, 671, 250, 702], &destination)],
+            );
+            let markdown = process_pdf_mem_with_options(&pdf, options.clone())
+                .unwrap()
+                .markdown
+                .unwrap();
+            assert!(
+                markdown.contains(&format!("[{label}]({destination})")),
+                "{markdown}"
+            );
+            assert_eq!(
+                markdown.matches(&format!("]({destination})")).count(),
+                1,
+                "{markdown}"
+            );
+            assert!(markdown.contains("This report presents"), "{markdown}");
+        }
+
+        let pdf = make_pdf_with_uri_annotations(
+            "Helvetica",
+            contents,
+            &[
+                ([71, 686, 250, 702], &destination),
+                ([71, 671, 250, 686], &destination),
+            ],
+        );
+        let markdown = process_pdf_mem_with_options(&pdf, options.clone())
+            .unwrap()
+            .markdown
+            .unwrap();
+        assert!(
+            markdown.contains(&format!("[{first_label}]({destination})")),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(&format!("[{second}]({destination})")),
+            "{markdown}"
+        );
+    }
+}
+
+#[test]
+fn annotated_url_in_a_table_uses_the_destination_with_its_final_slash() {
+    use std::fmt::Write;
+
+    let mut contents = String::new();
+    for x in [72, 220, 368, 516] {
+        writeln!(contents, "{x} 580 m {x} 700 l S").unwrap();
+    }
+    for y in (580..=700).step_by(24) {
+        writeln!(contents, "72 {y} m 516 {y} l S").unwrap();
+    }
+    for (row, cells) in [
+        ["Website", "Project", "Status"],
+        ["https://example.org", "Hosting", "Ready"],
+        ["Local archive", "Analysis", "In progress"],
+        ["Research notes", "Survey", "Ready"],
+        ["Field report", "Outreach", "Reviewed"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let y = 684 - row * 24;
+        for (col, text) in [78, 226, 374].into_iter().zip(cells) {
+            writeln!(contents, "BT /F1 10 Tf {col} {y} Td ({text}) Tj ET").unwrap();
+        }
+    }
+    let pdf = make_pdf_with_uri_annotations(
+        "Helvetica",
+        contents,
+        &[([76, 656, 184, 673], "https://example.org/")],
+    );
+    let markdown = process_pdf_mem(&pdf).unwrap().markdown.unwrap();
+    assert!(
+        markdown.contains("|[https://example.org](https://example.org/)|Hosting|Ready|"),
+        "{markdown}"
+    );
+}
+
 #[test]
 fn link_over_text_becomes_an_inline_markdown_anchor() {
     let buf = make_linked_page_pdf();

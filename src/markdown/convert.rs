@@ -1383,16 +1383,30 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             continue;
         }
 
-        // Regular text - join lines within same paragraph with space
+        // Preserve the source annotation when a visible URL wraps across lines.
         let cur_dot_leaders = has_dot_leaders(plain_trimmed);
-        if in_paragraph {
-            if cur_dot_leaders || prev_had_dot_leaders {
-                output.push('\n');
-            } else {
-                output.push(' ');
+        let joined_url = in_paragraph
+            && !cur_dot_leaders
+            && !prev_had_dot_leaders
+            && line_idx > 0
+            && super::links::join_wrapped_url(
+                &mut output,
+                &lines[line_idx - 1],
+                line,
+                trimmed,
+                anchors,
+            )
+            .is_some();
+        if !joined_url {
+            if in_paragraph {
+                if cur_dot_leaders || prev_had_dot_leaders {
+                    output.push('\n');
+                } else {
+                    output.push(' ');
+                }
             }
+            output.push_str(trimmed);
         }
-        output.push_str(trimmed);
         paragraph_in_wrapped_bold_run = if in_paragraph {
             paragraph_in_wrapped_bold_run || line_in_wrapped_bold_run
         } else {

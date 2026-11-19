@@ -754,14 +754,6 @@ pub(crate) struct LinkAnchor {
     pub(crate) width: f32,
     /// Height of the annotation's `/Rect`.
     pub(crate) height: f32,
-    /// `true` when the text under the whole rectangle spells this very URL,
-    /// so the reader already sees the destination.
-    ///
-    /// Decided over the annotation's complete anchor, not over one run of it:
-    /// a producer breaks a long URL across two lines, and each half on its own
-    /// looks like ordinary anchor text. See
-    /// [`PageLinkAnchors::mark_urls_written_out`].
-    pub(crate) writes_out_url: bool,
 }
 
 impl LinkAnchor {
@@ -862,8 +854,6 @@ pub(crate) struct PageLinkAnchors {
 pub(crate) struct AnchoredRange<'a> {
     pub(crate) start: usize,
     pub(crate) end: usize,
-    /// Mirrors [`LinkAnchor::writes_out_url`] for the claiming annotation.
-    pub(crate) writes_out_url: bool,
     /// Position of the claiming annotation in the page's anchor list, so a
     /// caller can tell two annotations apart when they share a URL.
     pub(crate) index: usize,
@@ -878,19 +868,6 @@ impl PageLinkAnchors {
     /// The page's annotations, in the order `ranges_for` indexes them.
     pub(crate) fn iter(&self) -> std::slice::Iter<'_, LinkAnchor> {
         self.anchors.iter()
-    }
-
-    /// Record which annotations have their own URL as their visible text.
-    ///
-    /// `anchor_text` returns the text under an annotation's whole rectangle,
-    /// by its position in this list. Whitespace is ignored in the comparison
-    /// because the text carries the producer's line break where the URL has
-    /// none.
-    pub(crate) fn mark_urls_written_out(&mut self, anchor_text: impl Fn(usize) -> Option<String>) {
-        for (index, anchor) in self.anchors.iter_mut().enumerate() {
-            anchor.writes_out_url =
-                anchor_text(index).is_some_and(|text| anchor_repeats_url(&text, &anchor.url));
-        }
     }
 
     /// The stretches of `item` covered by this page's links, in reading order
@@ -918,7 +895,6 @@ impl PageLinkAnchors {
                 anchor.char_range(item).map(|(start, end)| AnchoredRange {
                     start,
                     end,
-                    writes_out_url: anchor.writes_out_url,
                     index,
                     url: anchor.url.as_str(),
                 })
@@ -944,23 +920,6 @@ impl PageLinkAnchors {
     }
 }
 
-/// True when `anchor` is the destination itself, written out: identical to
-/// `url`, ignoring the whitespace a line break puts in the text and a trailing
-/// slash the producer may have dropped.
-///
-/// The whole destination, not a long-enough stretch of it. A partial match is
-/// exactly the case a reference list produces — a URL broken over two visual
-/// lines carries one annotation per line, so each annotation's text is a
-/// fragment of its own destination — and leaving such a fragment plain hands
-/// `format_urls` a truncated URL to linkify, which both loses the real
-/// destination and invents a wrong one (`https://docs.microsoft.com/x/edge-`
-/// for a link to `…/edge-policies#audiosandboxenabled`). A fragment is
-/// wrapped, so the destination survives whatever its anchor looks like.
-pub(crate) fn anchor_repeats_url(anchor: &str, url: &str) -> bool {
-    let squeezed: String = anchor.chars().filter(|c| !c.is_whitespace()).collect();
-    squeezed == url || squeezed.trim_end_matches('/') == url.trim_end_matches('/')
-}
-
 /// A `[anchor](url)` still being assembled: where its text starts in the
 /// rendered line, and where it points.
 ///
@@ -973,29 +932,14 @@ pub(crate) fn anchor_repeats_url(anchor: &str, url: &str) -> bool {
 struct OpenLink {
     url: String,
     start: usize,
-    /// The annotation writes its own URL out as the visible text, so the run
-    /// is emitted unwrapped. See [`LinkAnchor::writes_out_url`].
-    writes_out_url: bool,
 }
 
-/// Close the link `result` has been accumulating, wrapping everything since
-/// its start in `[anchor](url)`.
-///
-/// An anchor that already spells its own destination is left as it is:
-/// `MarkdownOptions::format_urls` links a bare URL in the text, so wrapping
-/// here would only produce `[https://x](https://x)`.
+/// Close the link around its text, before emitting any closing emphasis markers.
+/// Use the annotation's URI even when the anchor is itself a visible URL.
 fn close_open_link(result: &mut String, open: &mut Option<OpenLink>) {
-    let Some(OpenLink {
-        url,
-        start,
-        writes_out_url,
-    }) = open.take()
-    else {
+    let Some(OpenLink { url, start }) = open.take() else {
         return;
     };
-    if writes_out_url {
-        return;
-    }
     let anchor = result[start..].to_string();
     let trimmed = anchor.trim();
     if trimmed.is_empty() {
@@ -1005,7 +949,20 @@ fn close_open_link(result: &mut String, open: &mut Option<OpenLink>) {
     let lead = anchor.len() - anchor.trim_start().len();
     let mut wrapped = String::with_capacity(anchor.len() + url.len() + 8);
     wrapped.push_str(&anchor[..lead]);
-    wrapped.push_str(&inline_link(trimmed, &url));
+    // Wrapped headings can combine the visual lines before they are rendered.
+    // Discard the inserted spaces only if the visible text spells this URI.
+    let label = if (trimmed.starts_with("http://") || trimmed.starts_with("https://"))
+        && trimmed.chars().any(char::is_whitespace)
+        && trimmed
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .eq(url.chars())
+    {
+        &url
+    } else {
+        trimmed
+    };
+    wrapped.push_str(&inline_link(label, &url));
     wrapped.push_str(&anchor[lead + trimmed.len()..]);
     result.replace_range(start.., &wrapped);
 }
@@ -1047,7 +1004,6 @@ fn push_item_text_with_links(
             *open = Some(OpenLink {
                 url: range.url.to_string(),
                 start: result.len(),
-                writes_out_url: range.writes_out_url,
             });
         }
         result.extend(&chars[start..end]);
@@ -1839,7 +1795,7 @@ mod formatting_tests {
 
 #[cfg(test)]
 mod link_anchor_tests {
-    use super::{anchor_repeats_url, ItemType, LinkAnchor, PageLinkAnchors, TextItem, TextLine};
+    use super::{ItemType, LinkAnchor, PageLinkAnchors, TextItem, TextLine};
 
     /// A 12pt span whose glyphs occupy `width` points from `x`.
     fn span(text: &str, x: f32, width: f32) -> TextItem {
@@ -1890,7 +1846,6 @@ mod link_anchor_tests {
             y: 97.0,
             width,
             height: 18.0,
-            writes_out_url: false,
         }
     }
 
@@ -1942,7 +1897,6 @@ mod link_anchor_tests {
             y: 88.0,
             width: 52.0,
             height: 36.0,
-            writes_out_url: false,
         }]);
 
         assert_eq!(
@@ -1974,48 +1928,34 @@ mod link_anchor_tests {
             y: 79.0,
             width: 52.0,
             height: 18.0,
-            writes_out_url: false,
         }]);
 
         assert!(anchors.ranges_for(&line.items[0]).is_empty());
     }
 
     #[test]
-    fn an_annotation_that_writes_out_its_url_is_left_for_url_formatting() {
-        // Wrapping here would emit `[https://example.com](https://example.com)`;
-        // `MarkdownOptions::format_urls` links the bare URL instead.
+    fn an_annotation_that_writes_out_its_url_is_linked_directly() {
         let line = line(vec![span("https://example.com", 10.0, 75.0)]);
-        let mut anchors = PageLinkAnchors::new(vec![anchor("https://example.com", 8.0, 79.0)]);
-        anchors.mark_urls_written_out(|_| Some("https://example.com".to_string()));
+        let anchors = PageLinkAnchors::new(vec![anchor("https://example.com", 8.0, 79.0)]);
 
         assert_eq!(
             line.text_with_formatting_and_links(false, false, false, &anchors),
-            "https://example.com"
+            "[https://example.com](https://example.com)"
         );
     }
 
     #[test]
-    fn a_url_broken_over_two_runs_is_recognised_as_written_out() {
-        // The producer split the URL after a hyphen and hung an annotation on
-        // the whole of it. Decorating either half would sit between the
-        // hyphen and the text that postprocessing rejoins it to.
-        let mut anchors = PageLinkAnchors::new(vec![anchor(
-            "https://docs.microsoft.com/DeployEdge/microsoft-edge-policies",
-            8.0,
-            300.0,
-        )]);
-        anchors.mark_urls_written_out(|_| {
-            Some("https://docs.microsoft.com/DeployEdge/microsoft-edge- policies".to_string())
-        });
-        let line = line(vec![span(
-            "https://docs.microsoft.com/DeployEdge/microsoft-edge-policies",
-            10.0,
-            290.0,
-        )]);
+    fn a_written_out_url_split_into_runs_is_one_link() {
+        let url = "https://example.com/deploy-edge";
+        let line = line(vec![
+            span("https://example.com/deploy-", 10.0, 156.0),
+            span("edge", 166.0, 24.0),
+        ]);
+        let anchors = PageLinkAnchors::new(vec![anchor(url, 8.0, 184.0)]);
 
         assert_eq!(
             line.text_with_formatting_and_links(false, false, false, &anchors),
-            "https://docs.microsoft.com/DeployEdge/microsoft-edge-policies"
+            format!("[{url}]({url})")
         );
     }
 
@@ -2023,9 +1963,7 @@ mod link_anchor_tests {
     fn a_word_that_merely_ends_the_path_stays_a_link() {
         // "Home" is a fifth of the URL that ends in it: the reader is not
         // being shown the destination, so the anchor must be wrapped.
-        let mut anchors =
-            PageLinkAnchors::new(vec![anchor("https://example.com/en/Home", 8.0, 30.0)]);
-        anchors.mark_urls_written_out(|_| Some("Home".to_string()));
+        let anchors = PageLinkAnchors::new(vec![anchor("https://example.com/en/Home", 8.0, 30.0)]);
         let line = line(vec![span("Home", 10.0, 26.0)]);
 
         assert_eq!(
@@ -2131,6 +2069,19 @@ mod link_anchor_tests {
     }
 
     #[test]
+    fn adjacent_annotations_with_the_same_uri_share_one_inline_link() {
+        let line = line(vec![span("S.K.", 10.0, 24.0), span("Patra.", 38.0, 32.0)]);
+        let uri = "https://example.org/author";
+        let anchors = PageLinkAnchors::new(vec![anchor(uri, 8.0, 27.0), anchor(uri, 36.0, 36.0)]);
+        for format_bold in [false, true] {
+            assert_eq!(
+                line.text_with_formatting_and_links(format_bold, false, false, &anchors),
+                "[S.K. Patra.](https://example.org/author)"
+            );
+        }
+    }
+
+    #[test]
     fn a_link_run_ends_where_the_styling_changes() {
         // One rectangle over "Fonte Statista", the second word bold. The run
         // is cut at the style boundary so the anchor never has to wrap a
@@ -2198,7 +2149,6 @@ mod link_anchor_tests {
             y: 100.0,
             width: 60.0,
             height: 12.0 * share,
-            writes_out_url: false,
         }
     }
 
@@ -2228,49 +2178,5 @@ mod link_anchor_tests {
             line.text_with_formatting_and_links(false, false, false, &anchors),
             "[Statista](https://statista.com)"
         );
-    }
-
-    #[test]
-    fn an_anchor_that_is_only_part_of_its_destination_is_not_the_url_written_out() {
-        // The producer broke the URL after the hyphen and hung one annotation
-        // on each visual line. Each half spells most of a plausible URL and
-        // none of them spells this one, so neither may be left for
-        // `format_urls` to linkify into a destination that does not exist.
-        let url =
-            "https://docs.microsoft.com/DeployEdge/microsoft-edge-policies#audiosandboxenabled";
-        assert!(!anchor_repeats_url(
-            "https://docs.microsoft.com/DeployEdge/microsoft-edge-",
-            url
-        ));
-        assert!(!anchor_repeats_url("policies#audiosandboxenabled", url));
-        // The two halves together do spell it, and that is the only shape
-        // that counts as the destination written out.
-        assert!(anchor_repeats_url(
-            "https://docs.microsoft.com/DeployEdge/microsoft-edge- policies#audiosandboxenabled",
-            url
-        ));
-    }
-
-    #[test]
-    fn a_url_is_recognised_as_its_own_anchor_across_a_trailing_slash() {
-        assert!(anchor_repeats_url(
-            "https://example.com",
-            "https://example.com/"
-        ));
-        assert!(anchor_repeats_url(
-            " https://example.com/ ",
-            "https://example.com"
-        ));
-        assert!(!anchor_repeats_url("example", "https://www.example.com"));
-    }
-
-    #[test]
-    fn a_mailto_shown_without_its_scheme_is_not_its_own_anchor() {
-        // The address covers most of the destination but the scheme is never
-        // visible, so leaving it plain would drop the destination.
-        assert!(!anchor_repeats_url(
-            "info@example.com",
-            "mailto:info@example.com"
-        ));
     }
 }

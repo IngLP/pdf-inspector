@@ -73,7 +73,6 @@ pub(crate) fn anchors_by_page(links: &[TextItem]) -> HashMap<u32, PageLinkAnchor
             y: link.y,
             width: link.width,
             height: link.height,
-            writes_out_url: false,
         });
     }
     by_page
@@ -120,6 +119,93 @@ pub(crate) fn anchor_texts<'a>(
         }
     }
     texts
+}
+
+fn raw_url_fragment(line: &TextLine, anchors: &PageLinkAnchors, index: usize) -> String {
+    let mut fragment = String::new();
+    for item in line.items.iter().filter(|item| !item.is_script()) {
+        for range in anchors
+            .ranges_for(item)
+            .into_iter()
+            .filter(|range| range.index == index)
+        {
+            fragment.extend(
+                item.text
+                    .chars()
+                    .skip(range.start)
+                    .take(range.end - range.start)
+                    .filter(|ch| !ch.is_whitespace()),
+            );
+        }
+    }
+    fragment
+}
+
+/// Rejoin the two emitted fragments of a URL at a paragraph's line break.
+/// The rectangle's index distinguishes separate annotations sharing a URI.
+/// Matching the whole displayed URL avoids joining ordinary linked prose.
+pub(super) fn join_wrapped_url(
+    output: &mut String,
+    previous: &TextLine,
+    current: &TextLine,
+    rendered: &str,
+    anchors: &PageLinkAnchors,
+) -> Option<()> {
+    if previous.page != current.page {
+        return None;
+    }
+    let left_item = previous.items.last()?;
+    let right_item = current.items.first()?;
+    let left_ranges = anchors.emittable_ranges_for(left_item);
+    let left = left_ranges.last()?;
+    let right_ranges = anchors.emittable_ranges_for(right_item);
+    let right = right_ranges.first()?;
+    let url = left.url;
+    let (scheme, _) = url.split_once("://")?;
+    if left.index != right.index
+        || !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+    {
+        return None;
+    }
+
+    let left_text = raw_url_fragment(previous, anchors, left.index);
+    let right_text = raw_url_fragment(current, anchors, right.index);
+    if left_text.is_empty()
+        || right_text.is_empty()
+        || url.strip_prefix(&left_text) != Some(right_text.as_str())
+    {
+        return None;
+    }
+
+    // Reuse pieces of the one serialized link to match the two existing
+    // fragments. Their sizes include the bracket escapes from inline_link.
+    let joined = crate::types::inline_link(url, url);
+    let escaped_len = |text: &str| {
+        text.len()
+            + text
+                .bytes()
+                .filter(|byte| matches!(byte, b'[' | b']'))
+                .count()
+    };
+    let (left_label, rest) = joined.split_at(1 + escaped_len(&left_text));
+    let (right_label, ending) = rest.split_at(escaped_len(&right_text));
+
+    let trailing_text = output.trim_end_matches('*');
+    let leading_text = rendered.trim_start_matches('*');
+    if output.len() - trailing_text.len() != rendered.len() - leading_text.len() {
+        return None;
+    }
+    let before = trailing_text
+        .strip_suffix(ending)?
+        .strip_suffix(left_label)?;
+    let after = leading_text
+        .strip_prefix('[')?
+        .strip_prefix(right_label)?
+        .strip_prefix(ending)?;
+    output.truncate(before.len());
+    output.push_str(&joined);
+    output.push_str(after);
+    Some(())
 }
 
 /// Report a page's annotations with no anchor at all, for a page whose text
@@ -248,11 +334,7 @@ pub(crate) fn anchor_table_cells(
         else {
             continue;
         };
-        let replacement = if anchor.writes_out_url {
-            text.clone()
-        } else {
-            crate::types::inline_link(text, &anchor.url)
-        };
+        let replacement = crate::types::inline_link(text, &anchor.url);
         cells[row][column].replace_range(start..start + text.len(), &replacement);
         claimed.insert(key, text.clone());
         changed = true;
