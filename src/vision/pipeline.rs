@@ -168,7 +168,8 @@ impl OcrPdfOptions {
 /// Complete native/OCR Markdown output for a PDF request.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OcrPdfResult {
-    /// Final document Markdown in selected-page order.
+    /// Final document Markdown in selected-page order, joining tables across
+    /// consecutive page boundaries when their column counts match.
     pub markdown: String,
     /// Final per-page Markdown and provenance, using 1-indexed page numbers.
     pub pages: Vec<FusedPageMarkdown>,
@@ -983,16 +984,142 @@ fn canonical_table_text(text: &str) -> String {
         .join(" ")
 }
 
+/// Split the pipe rows emitted by the page renderers. Escaped pipes
+/// belong to the cell, and empty cells still occupy a column.
+fn pipe_cells(line: &str) -> Option<impl Iterator<Item = &str>> {
+    let cells = line.trim().strip_prefix('|')?.strip_suffix('|')?;
+    let trailing_backslashes = cells
+        .bytes()
+        .rev()
+        .take_while(|&byte| byte == b'\\')
+        .count();
+    if trailing_backslashes % 2 != 0 {
+        return None;
+    }
+
+    let mut escaped = false;
+    Some(
+        cells
+            .split(move |ch| {
+                let separator = ch == '|' && !escaped;
+                escaped = ch == '\\' && !escaped;
+                separator
+            })
+            .map(str::trim),
+    )
+}
+
+struct PipeTableStart<'a> {
+    header: &'a str,
+    header_cells: Vec<&'a str>,
+    after_separator: &'a str,
+}
+
+fn pipe_table_start(markdown: &str) -> Option<PipeTableStart<'_>> {
+    let (header, rest) = markdown.split_once('\n')?;
+    let (separator, after_separator) = rest.split_once('\n').unwrap_or((rest, ""));
+    let header_cells: Vec<_> = pipe_cells(header)?.collect();
+    let columns = pipe_cells(separator)?.try_fold(0, |columns, cell| {
+        let cell = cell.strip_prefix(':').unwrap_or(cell);
+        let dashes = cell.strip_suffix(':').unwrap_or(cell);
+        (!dashes.is_empty() && dashes.bytes().all(|byte| byte == b'-')).then_some(columns + 1)
+    })?;
+    (columns == header_cells.len()).then_some(PipeTableStart {
+        header,
+        header_cells,
+        after_separator,
+    })
+}
+
+fn trailing_pipe_table(markdown: &str) -> Option<PipeTableStart<'_>> {
+    let tail = markdown
+        .rsplit('\n')
+        .take_while(|line| pipe_cells(line).is_some())
+        .map(|line| line.len() + 1)
+        .sum::<usize>();
+    let start = markdown.len().saturating_sub(tail);
+    pipe_table_start(markdown[start..].trim_start_matches('\n'))
+}
+
+/// Append rows to the table just written. If an entire following page is
+/// consumed, continue looking before the assembler emits any of its markers.
+fn append_table_continuations(
+    document: &mut String,
+    page_number: u32,
+    markdown: &str,
+    following_pages: &mut [(u32, &str)],
+) {
+    let Some(first) = trailing_pipe_table(markdown) else {
+        return;
+    };
+
+    let mut previous_page = page_number;
+    for (next_page, body) in following_pages {
+        if previous_page.checked_add(1) != Some(*next_page) {
+            break;
+        }
+        let Some(next) = pipe_table_start(body) else {
+            break;
+        };
+        if first.header_cells.len() != next.header_cells.len() {
+            break;
+        }
+
+        if first.header_cells != next.header_cells {
+            document.push('\n');
+            document.push_str(next.header);
+        }
+        let body_bytes = next
+            .after_separator
+            .split_inclusive('\n')
+            .take_while(|line| pipe_cells(line).is_some())
+            .map(str::len)
+            .sum();
+        let (rows, rest) = next.after_separator.split_at(body_bytes);
+        if !rows.is_empty() {
+            document.push('\n');
+            document.push_str(rows.trim_end_matches(['\r', '\n']));
+        }
+
+        // Remove blank lines left by the moved table, keeping any indentation
+        // on the first line of the page's remaining content.
+        let blank_bytes: usize = rest
+            .split_inclusive('\n')
+            .take_while(|line| line.trim().is_empty())
+            .map(str::len)
+            .sum();
+        *body = &rest[blank_bytes..];
+        if !body.is_empty() {
+            break;
+        }
+        previous_page = *next_page;
+    }
+}
+
 fn assemble_document_markdown(pages: &[FusedPageMarkdown], include_page_numbers: bool) -> String {
+    let mut sections: Vec<_> = pages
+        .iter()
+        .map(|page| (page.page_number, page.markdown.trim()))
+        .collect();
     let mut document = String::new();
-    for (index, page) in pages.iter().enumerate() {
+    for index in 0..sections.len() {
+        let (page_number, body) = sections[index];
+        // Without markers, a page whose table moved has no remaining output.
+        let moved_table = body.is_empty() && !pages[index].markdown.trim().is_empty();
+        if !include_page_numbers && moved_table {
+            continue;
+        }
         if index > 0 {
             document.push_str("\n\n");
         }
         if include_page_numbers {
-            document.push_str(&format!("<!-- Page {} -->\n\n", page.page_number));
+            document.push_str(&format!("<!-- Page {page_number} -->"));
+            if !moved_table {
+                document.push_str("\n\n");
+            }
         }
-        document.push_str(page.markdown.trim());
+        document.push_str(body);
+        append_table_continuations(&mut document, page_number, body, &mut sections[index + 1..]);
     }
     if !document.is_empty() {
         document.push('\n');
@@ -1401,6 +1528,38 @@ mod tests {
         assert!(may_preserve_extractor_candidate(3, &reasons));
         assert!(!may_preserve_extractor_candidate(4, &reasons));
         assert!(!may_preserve_extractor_candidate(5, &reasons));
+    }
+
+    #[test]
+    fn table_join_honors_escaped_pipes_empty_cells_and_alignment() {
+        let first = "| Key\\|Alias || Total |\n| :--- | ---: | :---: |\n| A\\|B || 1 |";
+        let second = "|Key\\|Alias||Total|\n|---:|---|---|\n|C\\|D||2|\n \t\n![chart](image)";
+        let mut following = [(2, second)];
+        let mut document = first.to_string();
+        append_table_continuations(&mut document, 1, first, &mut following);
+
+        assert_eq!(document, format!("{first}\n|C\\|D||2|"));
+        assert_eq!(following, [(2, "![chart](image)")]);
+    }
+
+    #[test]
+    fn table_join_stops_at_a_page_gap_or_an_intervening_image() {
+        let first = "|Region|Amount|\n|---|---|\n|North|1|";
+        let second = "|Region|Amount|\n|---|---|\n|South|2|";
+        let left_image = format!("{first}\n\n![chart](image)");
+        let right_image = format!("![chart](image)\n\n{second}");
+
+        for (page_number, left, right) in [
+            (3, first, second),
+            (2, left_image.as_str(), second),
+            (2, first, right_image.as_str()),
+        ] {
+            let mut following = [(page_number, right)];
+            let mut document = left.to_string();
+            append_table_continuations(&mut document, 1, left, &mut following);
+            assert_eq!(document, left);
+            assert_eq!(following, [(page_number, right)]);
+        }
     }
 
     #[test]

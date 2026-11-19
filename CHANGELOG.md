@@ -57,6 +57,11 @@ version and date. Earlier releases are described in their
   the Python and Node bindings. Same precedent as `TextItem` below: the struct
   stays constructible rather than becoming `#[non_exhaustive]`.
 
+- The OCR pipeline joins tables with matching column counts across
+  consecutive page boundaries. Repeated headers are removed, and a different
+  continuation header is kept as a data row. Page markers follow the joined
+  table when enabled.
+
 ## [1.26.1] - 2026-11-15
 
 Changes since 1.26.0.
