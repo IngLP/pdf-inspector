@@ -225,6 +225,27 @@ jobs:
               throw "The existing Markdown was not replaced: $messages"
           }
 
+      - name: 'Prova: rifiuto cartelle al posto dei file'
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $pdfDir = Join-Path $env:PDF2MD_TEST_DIR 'cartella.pdf'
+          $pdf = Join-Path $env:PDF2MD_TEST_DIR 'destinazione-occupata.pdf'
+          $outputDir = [IO.Path]::ChangeExtension($pdf, '.md')
+          $null = New-Item -ItemType Directory -Path $pdfDir, $outputDir
+          Copy-Item tests/fixtures/thermo-freon12.pdf -Destination $pdf
+
+          $messages = & "$env:PDF2MD_EXTRACTED/pdf2md.cmd" $pdfDir $pdf 2>&1
+          $transcript = $messages -join "`n"
+          if ($LASTEXITCODE -ne 1 -or
+              !$transcript.Contains('Errore: "' + $pdfDir + '" non esiste oppure non ha estensione .pdf.') -or
+              !$transcript.Contains('Errore: conversione di "' + $pdf + '" non riuscita.') -or
+              $transcript -cmatch '(?m)^Conversione di ' -or
+              (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($pdfDir, '.md'))) -or
+              @(Get-ChildItem -LiteralPath $outputDir -Force).Count -ne 0) {
+              throw "Expected both directories to be rejected before conversion: $messages"
+          }
+          $global:LASTEXITCODE = 0
+
       - name: 'Prova: più file, uno inesistente'
         run: |
           $PSNativeCommandUseErrorActionPreference = $false

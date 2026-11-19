@@ -16,8 +16,11 @@ set "input=%~f1"
 set "output=%~dpn1.md"
 if /i not "%~x1"==".pdf" goto invalid
 if not exist "%input%" goto invalid
-if exist "%input%\." goto invalid
-if exist "%output%\." goto failed
+set "input_attrs=%~a1"
+if /i "%input_attrs:~0,1%"=="d" goto invalid
+set "output_attrs="
+for %%F in ("%output%") do set "output_attrs=%%~aF"
+if /i "%output_attrs:~0,1%"=="d" goto failed
 
 rem Stage the result beside the PDF so a conversion error preserves any old Markdown.
 set "staging=%~dp1.pdf2md-%RANDOM%-%RANDOM%"
