@@ -1,0 +1,35 @@
+pdf2md per Windows a 64 bit (x64)
+
+PRIMA DI INIZIARE
+1. Fai clic destro sul file ZIP scaricato e apri Proprietà. Se compare la
+   casella Sblocca, selezionala e premi Applica prima di estrarre lo ZIP.
+   L'eseguibile è privo di firma digitale.
+2. Fai clic destro sullo ZIP e scegli Estrai tutto. Apri la cartella pdf2md
+   che hai estratto. Tieni insieme tutti i suoi file e sottocartelle.
+
+CONVERTIRE UN PDF
+Trascina il PDF sul file pdf2md (pdf2md.cmd se vedi le estensioni). Al
+termine trovi un file .md accanto al PDF. Per esempio, relazione.pdf diventa
+relazione.md. La finestra ti dice dove ha scritto il file. Se esiste già
+un .md con lo stesso nome, una conversione riuscita lo sovrascrive.
+
+Puoi trascinare più PDF insieme. La finestra mostra il risultato per ciascuno.
+
+USARE IL TERMINALE
+Fai doppio clic su aggiungi-al-path una volta, poi chiudi il terminale, se
+era aperto, e aprine uno nuovo. Puoi scrivere:
+
+    pdf2md relazione.pdf
+    pdf2md "C:\Documenti di prova\relazione è.pdf"
+
+COSA ASPETTARSI
+Il programma estrae direttamente il testo già presente nel PDF. Per le
+pagine scansionate riconosce il testo sul tuo PC, anche senza connessione.
+Una scansione nitida dà risultati migliori. Per tabelle e formule scansionate
+controlla il PDF originale: struttura e simboli possono andare persi.
+
+IN CASO DI ERRORE
+Controlla che il PDF si apra nel tuo lettore e che tu possa scrivere nella
+cartella del PDF. Se hai aperto il programma nello ZIP, estrai prima tutti
+i file. Se il problema continua, conserva il messaggio mostrato nella
+finestra per chi ti aiuta.

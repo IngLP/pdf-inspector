@@ -1,0 +1,523 @@
+name: pdf2md Windows x64
+
+on:
+  push:
+    branches: [windows-bundle]
+    tags: ['pdf2md-windows-*']
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the OCR CLI
+        run: cargo build --locked --release --features ocr --bin pdf2md
+
+      - name: Assemble the application and native runtimes
+        env:
+          # Firecrawl native-v7988 SHA256SUMS and the official ONNX Runtime wheel digest on PyPI.
+          PDFIUM_SHA256: 6f398552d8021a89078f64466557251a204999177287b876be49877eb8750d50
+          ORT_WHEEL_SHA256: 20c321cf187ba496e648acf6b4cf90b4d398b0d17c2a77fdaeba365b908cc1c1
+        run: |
+          function Get-VerifiedArchive($url, $path, $sha256) {
+              Invoke-WebRequest -Uri $url -OutFile $path
+              if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash -ne $sha256) {
+                  throw "SHA-256 mismatch: $url"
+              }
+          }
+
+          $bundle = Join-Path $env:RUNNER_TEMP 'bundle/pdf2md'
+          $bin = Join-Path $bundle 'bin'
+          $pdfiumLicenses = Join-Path $bundle 'licenze/PDFium'
+          $ortLicenses = Join-Path $bundle 'licenze/ONNX Runtime'
+          $null = New-Item -ItemType Directory -Path $bin, $pdfiumLicenses, $ortLicenses
+          Copy-Item -LiteralPath 'packaging/windows/pdf2md.cmd', 'packaging/windows/aggiungi-al-path.cmd', 'packaging/windows/LEGGIMI.txt' -Destination $bundle
+          Copy-Item -LiteralPath packaging/windows/bin/pausa-se-da-esplora.cmd -Destination $bin
+          Copy-Item target/release/pdf2md.exe -Destination $bin
+          Copy-Item LICENSE -Destination "$bundle/licenze/pdf-inspector.txt"
+          Copy-Item external/bcmaps/LICENSE -Destination "$bundle/licenze/Adobe CMaps.txt"
+
+          $pdfium = Join-Path $env:RUNNER_TEMP 'pdfium'
+          $pdfiumArchive = "$pdfium.tgz"
+          Get-VerifiedArchive 'https://github.com/firecrawl/pdfium-rs/releases/download/native-v7988/firecrawl-pdfium-win-x64.tgz' $pdfiumArchive $env:PDFIUM_SHA256
+          $null = New-Item -ItemType Directory -Path $pdfium
+          tar -xzf $pdfiumArchive -C $pdfium
+          if ($LASTEXITCODE -ne 0) { throw 'PDFium extraction failed' }
+          Copy-Item "$pdfium/bin/pdfium.dll" -Destination $bin
+          Copy-Item "$pdfium/LICENSE", "$pdfium/licenses" -Destination $pdfiumLicenses -Recurse
+
+          $ort = Join-Path $env:RUNNER_TEMP 'onnxruntime'
+          $ortWheel = Join-Path $env:RUNNER_TEMP 'onnxruntime-1.27.0-cp312-cp312-win_amd64.whl'
+          Get-VerifiedArchive 'https://files.pythonhosted.org/packages/4f/88/8ec9db1a4d126bb8b758992beb40d1249df171917d75f44a327eb5f20dda/onnxruntime-1.27.0-cp312-cp312-win_amd64.whl' $ortWheel $env:ORT_WHEEL_SHA256
+          if ((Get-Item -LiteralPath $ortWheel).Length -ne 13358769) {
+              throw 'Unexpected size for the ONNX Runtime wheel'
+          }
+          $ortDlls = 'onnxruntime/capi/onnxruntime.dll', 'onnxruntime/capi/onnxruntime_providers_shared.dll'
+          $ortNotices = 'onnxruntime/LICENSE', 'onnxruntime/ThirdPartyNotices.txt'
+          $null = New-Item -ItemType Directory -Path $ort
+          tar -xf $ortWheel -C $ort @ortDlls @ortNotices
+          if ($LASTEXITCODE -ne 0) { throw 'ONNX Runtime wheel extraction failed' }
+          Copy-Item -LiteralPath ($ortDlls | ForEach-Object { Join-Path $ort $_ }) -Destination $bin
+          Copy-Item -LiteralPath ($ortNotices | ForEach-Object { Join-Path $ort $_ }) -Destination $ortLicenses
+
+          # Ship the redistributable CRT beside the executable for PCs without it.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or !$vs) { throw 'Visual Studio C++ tools are missing' }
+          $dumpbin = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' |
+              Select-Object -First 1
+          if ($LASTEXITCODE -ne 0 -or !$dumpbin) { throw 'Visual Studio dumpbin is missing' }
+          $crt = Get-ChildItem "$vs/VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT" -Directory |
+              Sort-Object { [version]$_.Parent.Parent.Name } -Descending | Select-Object -First 1
+          if (!$crt) { throw 'Visual Studio x64 redistributable CRT is missing' }
+          Copy-Item "$($crt.FullName)/*.dll" -Destination $bin
+          @(
+              'Microsoft Visual C++ Runtime. Windows x64, app-local redistributable files.'
+              "From Visual Studio on the build runner: VC/Redist/MSVC/$($crt.Parent.Parent.Name)/x64/$($crt.Name)."
+              'https://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files'
+          ) |
+              Set-Content "$bundle/licenze/Microsoft Visual C++ Runtime.txt"
+
+          "PDF2MD_BUNDLE=$bundle" >> $env:GITHUB_ENV
+          "PDF2MD_DUMPBIN=$dumpbin" >> $env:GITHUB_ENV
+
+      - name: Generate Rust crate license notices
+        run: |
+          cargo install cargo-about --version 0.9.3 --locked --features cli
+          if ($LASTEXITCODE -ne 0) { throw 'cargo-about installation failed' }
+          cargo about generate --locked --fail --features ocr --config packaging/windows/about.toml --output-file "$env:PDF2MD_BUNDLE/licenze/crate-rust.txt" packaging/windows/about.hbs
+          if ($LASTEXITCODE -ne 0) { throw 'Rust crate license notice generation failed' }
+
+      - name: Provision the verified OCR model
+        run: |
+          $bin = Join-Path $env:PDF2MD_BUNDLE 'bin'
+          $env:PDFIUM_LIB_PATH = Join-Path $bin 'pdfium.dll'
+          $env:ORT_DYLIB_PATH = Join-Path $bin 'onnxruntime.dll'
+          $env:PDF_INSPECTOR_MODEL_CACHE = Join-Path $env:RUNNER_TEMP 'ocr-provisioning'
+          $result = & "$bin/pdf2md.exe" --ocr force --json tests/fixtures/scan_with_native_header_text.pdf
+          if ($LASTEXITCODE -ne 0) { throw 'OCR model provisioning failed' }
+          $result = $result | ConvertFrom-Json
+          if ($result.pages_routed_to_ocr.Count -ne 1 -or $result.pages_routed_to_ocr[0] -ne 1) {
+              throw 'The provisioning fixture did not run OCR on page 1'
+          }
+
+          $source = Join-Path $env:PDF_INSPECTOR_MODEL_CACHE 'pp-ocrv6-small/oar-ocr-v0.7.0'
+          $models = Join-Path $env:PDF2MD_BUNDLE 'models/pp-ocrv6-small'
+          $null = New-Item -ItemType Directory -Path $models
+          foreach ($file in 'pp-ocrv6_small_det.onnx', 'pp-ocrv6_small_rec.onnx', 'ppocrv6_dict.txt') {
+              Copy-Item -LiteralPath "$source/$file" -Destination $models
+          }
+          $license = Join-Path $env:PDF2MD_BUNDLE 'licenze/oar-ocr-Apache-2.0.txt'
+          Invoke-WebRequest 'https://raw.githubusercontent.com/GreatV/oar-ocr/v0.7.0/LICENSE' -OutFile $license
+          if ((Get-FileHash -LiteralPath $license -Algorithm SHA256).Hash -ne '8a7ec3e5de8c98ead49da38ca820edb995102e95093da040b304413e37b6c607') {
+              throw 'oar-ocr license SHA-256 mismatch'
+          }
+          $license = Join-Path $env:PDF2MD_BUNDLE 'licenze/PP-OCRv6-small-PaddleOCR-Apache-2.0.txt'
+          Invoke-WebRequest 'https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/v3.7.0/LICENSE' -OutFile $license
+          if ((Get-FileHash -LiteralPath $license -Algorithm SHA256).Hash -ne '3840c5c0c61c294264d2dd77b8777be6ddd90121ef4e0e64abcd22edea581d6e') {
+              throw 'PaddleOCR license SHA-256 mismatch'
+          }
+
+      - name: Archive and extract the distribution for testing
+        run: |
+          $package = Join-Path $env:RUNNER_TEMP 'package'
+          $null = New-Item -ItemType Directory -Path $package
+          $label = if ($env:GITHUB_REF_NAME -like 'pdf2md-windows-*') { $env:GITHUB_REF_NAME } else { "pdf2md-windows-dev-$env:GITHUB_RUN_ID" }
+          $zip = Join-Path $package "$label.zip"
+          Compress-Archive -LiteralPath $env:PDF2MD_BUNDLE -DestinationPath $zip
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $label.zip" | Set-Content -LiteralPath "$zip.sha256" -Encoding ascii
+
+          $extracted = Join-Path $env:RUNNER_TEMP 'distribution'
+          Expand-Archive -LiteralPath $zip -DestinationPath $extracted
+          $root = Join-Path $extracted 'pdf2md'
+          foreach ($name in 'pdf2md.cmd', 'aggiungi-al-path.cmd', 'bin/pausa-se-da-esplora.cmd') {
+              $script = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Join-Path $root $name)))
+              if (!$script.StartsWith('@echo off') -or $script -notmatch "\r\n" -or $script -match "(?<!\r)\n") {
+                  throw "Expected a CRLF batch file without BOM: $name"
+              }
+          }
+          foreach ($name in 'crate-rust.txt', 'oar-ocr-Apache-2.0.txt', 'PP-OCRv6-small-PaddleOCR-Apache-2.0.txt') {
+              if ((Get-Item -LiteralPath "$root/licenze/$name").Length -eq 0) {
+                  throw "Expected non-empty bundled license notice: $name"
+              }
+          }
+          $tests = Join-Path $env:RUNNER_TEMP 'prove'
+          $null = New-Item -ItemType Directory -Path $tests
+          "PDF2MD_TEST_DIR=$tests" >> $env:GITHUB_ENV
+          "PDF2MD_EXTRACTED=$root" >> $env:GITHUB_ENV
+          "PDF2MD_PACKAGE=$package" >> $env:GITHUB_ENV
+
+      - name: 'Prova: runtime Visual C++ nello ZIP'
+        run: |
+          $bin = Join-Path $env:PDF2MD_EXTRACTED 'bin'
+          $crtName = '^(?:msvcp|msvcr|vcruntime|vccorlib|concrt|vcomp)\d+\w*\.dll$'
+          $required = @('MSVCP140.dll', 'MSVCP140_1.dll', 'VCRUNTIME140.dll', 'VCRUNTIME140_1.dll')
+          $binaries = Get-ChildItem -LiteralPath $bin -File | Where-Object {
+              $_.Extension -in '.exe', '.dll' -and $_.Name -notmatch $crtName
+          }
+          foreach ($binary in $binaries) {
+              $imports = & $env:PDF2MD_DUMPBIN /dependents $binary.FullName
+              if ($LASTEXITCODE -ne 0) { throw "Failed to read imports of $($binary.Name)" }
+              $required += $imports | ForEach-Object {
+                  $name = $_.Trim()
+                  if ($name -match $crtName) { $name }
+              }
+          }
+          foreach ($file in ($required | Sort-Object -Unique)) {
+              $path = Join-Path $bin $file
+              if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing bundled CRT: $file" }
+              $headers = & $env:PDF2MD_DUMPBIN /headers $path
+              if ($LASTEXITCODE -ne 0 -or ($headers -join "`n") -notmatch '8664 machine \(x64\)') {
+                  throw "Bundled CRT is not an x64 PE file: $file"
+              }
+          }
+
+      - name: 'Prova: lanciatore da terminale'
+        timeout-minutes: 2
+        run: |
+          $pdf = Join-Path $env:PDF2MD_TEST_DIR 'terminale.pdf'
+          Copy-Item tests/fixtures/thermo-freon12.pdf -Destination $pdf
+          $messages = & "$env:PDF2MD_EXTRACTED/pdf2md.cmd" $pdf 2>&1
+          $transcript = $messages -join "`n"
+          if ($LASTEXITCODE -ne 0 -or $transcript -cnotmatch '(?m)^Scritto: "' -or
+              $transcript -cnotmatch '(?m)^Conversione di ".+" in corso\.\.\.\r?\nScritto: "' -or
+              $transcript -match 'Premi un tasto per chiudere|PDF to Markdown Conversion|Markdown written to:') {
+              throw "Terminal conversion did not finish normally: $messages"
+          }
+          $output = [IO.Path]::ChangeExtension($pdf, '.md')
+          $expected = Join-Path $env:PDF2MD_TEST_DIR 'terminale-expected.md'
+          & "$env:PDF2MD_EXTRACTED/bin/pdf2md.exe" --ocr auto --ocr-offline $pdf $expected 2>$null
+          if ($LASTEXITCODE -ne 0 -or (Get-FileHash $output).Hash -ne (Get-FileHash $expected).Hash) {
+              throw 'Raw Markdown differs from the native PDF reference'
+          }
+          $markdown = [Text.UTF8Encoding]::new($false, $true).GetString([IO.File]::ReadAllBytes($output))
+          if ($markdown -notmatch 'Freon' -or @(Get-ChildItem $env:PDF2MD_TEST_DIR -Directory -Force -Filter '.pdf2md-*').Count -ne 0) {
+              throw 'Expected UTF-8 document Markdown without CLI diagnostics'
+          }
+
+      - name: 'Prova: percorso con spazi e accenti'
+        run: |
+          $dir = Join-Path $env:PDF2MD_TEST_DIR 'Documenti di prova'
+          $null = New-Item -ItemType Directory -Path $dir
+          $pdf = Join-Path $dir 'relazione è.pdf'
+          Copy-Item tests/fixtures/thermo-freon12.pdf -Destination $pdf
+          & "$env:PDF2MD_EXTRACTED/pdf2md.cmd" $pdf
+          if ($LASTEXITCODE -ne 0 -or (Get-Content -LiteralPath "$dir/relazione è.md" -Raw) -notmatch 'Freon') {
+              throw 'Conversion failed for a path with spaces and accents'
+          }
+
+      - name: 'Prova: sovrascrittura'
+        run: |
+          $pdf = Join-Path $env:PDF2MD_TEST_DIR 'terminale.pdf'
+          $output = [IO.Path]::ChangeExtension($pdf, '.md')
+          Set-Content -LiteralPath $output 'Testo precedente'
+          $messages = & "$env:PDF2MD_EXTRACTED/pdf2md.cmd" $pdf 2>&1
+          if ($LASTEXITCODE -ne 0 -or ($messages -join "`n") -notmatch 'Sovrascritto:' -or
+              (Get-Content -LiteralPath $output -Raw) -notmatch 'Freon') {
+              throw "The existing Markdown was not replaced: $messages"
+          }
+
+      - name: 'Prova: più file, uno inesistente'
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $missing = Join-Path $env:PDF2MD_TEST_DIR 'inesistente.pdf'
+          $bad = Join-Path $env:PDF2MD_TEST_DIR 'non valido.pdf'
+          $previous = Join-Path $env:PDF2MD_TEST_DIR 'da conservare.md'
+          $badWithOutput = [IO.Path]::ChangeExtension($previous, '.pdf')
+          $goodDir = Join-Path $env:PDF2MD_TEST_DIR 'altri PDF'
+          $null = New-Item -ItemType Directory -Path $goodDir
+          $good = Join-Path $goodDir 'successivo.pdf'
+          Set-Content -LiteralPath $bad 'Not a PDF'
+          Copy-Item -LiteralPath $bad -Destination $badWithOutput
+          Set-Content -LiteralPath $previous 'Testo da conservare'
+          Copy-Item tests/fixtures/thermo-freon12.pdf -Destination $good
+          $messages = & "$env:PDF2MD_EXTRACTED/pdf2md.cmd" $missing $bad $badWithOutput $good 2>&1
+          if ($LASTEXITCODE -eq 0 -or ($messages -join "`n") -notmatch 'Errore: .*inesistente\.pdf' -or
+              ($messages -join "`n") -notmatch 'Errore: .*non valido\.pdf' -or
+              ($messages -join "`n") -notmatch 'Errore: .*da conservare\.pdf' -or
+              ($messages -join "`n") -cnotmatch '(?m)^Error: Not a PDF:' -or
+              (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($missing, '.md'))) -or
+              (Test-Path -LiteralPath ([IO.Path]::ChangeExtension($bad, '.md'))) -or
+              (Get-Content -LiteralPath $previous) -cne 'Testo da conservare' -or
+              @(Get-ChildItem $env:PDF2MD_TEST_DIR -Recurse -Directory -Force -Filter '.pdf2md-*').Count -ne 0 -or
+              (Get-Content -LiteralPath ([IO.Path]::ChangeExtension($good, '.md')) -Raw) -notmatch 'Freon') {
+              throw "Expected named errors, continued conversion, and aggregate failure: $messages"
+          }
+          $global:LASTEXITCODE = 0 # The failure above is the expected outcome.
+
+      - name: 'Prova: codici di uscita del lanciatore'
+        timeout-minutes: 5
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $test = Join-Path $env:PDF2MD_TEST_DIR 'codici di uscita'
+          $null = New-Item -ItemType Directory -Path $test
+          Copy-Item -LiteralPath $env:PDF2MD_EXTRACTED -Destination $test -Recurse
+          $launcher = Join-Path $test 'pdf2md/pdf2md.cmd'
+          $substitute = Join-Path $test 'pdf2md/bin/pdf2md.exe'
+          $source = Join-Path $test 'exit_code.rs'
+          @'
+          use std::{env, path::PathBuf, process};
+
+          fn main() {
+              let pdf = PathBuf::from(env::args_os().last().expect("input path"));
+              match pdf.file_stem().and_then(|name| name.to_str()) {
+                  Some("exit-0") => print!("Markdown dal sostituto"),
+                  Some("exit-1") => process::exit(1),
+                  Some("exit--1073741819") => process::exit(-1073741819),
+                  _ => process::exit(2),
+              }
+          }
+          '@ | Set-Content -LiteralPath $source -Encoding utf8
+          rustc --edition 2021 $source -o $substitute
+          if ($LASTEXITCODE -ne 0) { throw 'The exit-code substitute did not compile' }
+
+          function Assert-LauncherExit([int]$code) {
+              $pdf = Join-Path $test "exit-$code.pdf"
+              $output = [IO.Path]::ChangeExtension($pdf, '.md')
+              Set-Content -LiteralPath $pdf 'Fixture for the substitute executable'
+              Set-Content -LiteralPath $output 'Markdown preesistente' -NoNewline
+              $before = (Get-FileHash -LiteralPath $output).Hash
+              & $substitute $pdf | Out-Null
+              if ($LASTEXITCODE -ne $code) { throw "Expected substitute exit $code, got $LASTEXITCODE" }
+
+              $messages = & $launcher $pdf 2>&1
+              $result = $LASTEXITCODE
+              if ($code -eq 0) {
+                  if ($result -ne 0 -or (Get-Content -LiteralPath $output -Raw) -cne 'Markdown dal sostituto') {
+                      throw "Successful conversion did not publish Markdown: $messages"
+                  }
+              } elseif ($result -eq 0 -or (Get-FileHash -LiteralPath $output).Hash -cne $before) {
+                  throw "Executable exit $code must preserve Markdown and fail the launcher"
+              }
+              if (@(Get-ChildItem -LiteralPath $test -Directory -Force -Filter '.pdf2md-*').Count -ne 0) {
+                  throw "Staging remained after executable exit $code"
+              }
+              Write-Host "Executable exit $code, launcher exit $result"
+          }
+
+          foreach ($code in 0, 1, -1073741819) { Assert-LauncherExit $code }
+
+          # Reproduce the original bug in the same disposable copy.
+          $original = [IO.File]::ReadAllBytes($launcher)
+          $text = [Text.Encoding]::ASCII.GetString($original)
+          $mutated = $text.Replace("if not errorlevel 0 goto cleanup_failed`r`n", '')
+          if ($mutated -ceq $text) { throw 'Negative exit guard was not found for the mutation' }
+          $mutationFailed = $false
+          try {
+              [IO.File]::WriteAllText($launcher, $mutated, [Text.Encoding]::ASCII)
+              Assert-LauncherExit -1073741819
+          } catch {
+              if ($_.Exception.Message -cne 'Executable exit -1073741819 must preserve Markdown and fail the launcher') { throw }
+              $mutationFailed = $true
+              Write-Host $_.Exception.Message
+          } finally {
+              [IO.File]::WriteAllBytes($launcher, $original)
+          }
+          if (!$mutationFailed) { throw 'The negative exit test accepted the original bug' }
+          $global:LASTEXITCODE = 0
+
+      - name: 'Prova: PDF senza testo'
+        run: |
+          $pdf = Join-Path $env:PDF2MD_TEST_DIR 'bianco.pdf'
+          $objects = @(
+              '<< /Type /Catalog /Pages 2 0 R >>'
+              '<< /Type /Pages /Kids [3 0 R] /Count 1 >>'
+              '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>'
+              "<< /Length 0 >>`nstream`n`nendstream"
+          )
+          $contents = "%PDF-1.4`n"
+          $xref = "0000000000 65535 f `n"
+          for ($i = 0; $i -lt $objects.Count; $i++) {
+              $xref += "{0:D10} 00000 n `n" -f $contents.Length
+              $contents += "$($i + 1) 0 obj`n$($objects[$i])`nendobj`n"
+          }
+          $contents += "xref`n0 5`n${xref}trailer`n<< /Size 5 /Root 1 0 R >>`nstartxref`n$($contents.Length)`n%%EOF`n"
+          [IO.File]::WriteAllText($pdf, $contents, [Text.Encoding]::ASCII)
+          $messages = & "$env:PDF2MD_EXTRACTED/pdf2md.cmd" $pdf 2>&1
+          $output = [IO.Path]::ChangeExtension($pdf, '.md')
+          if ($LASTEXITCODE -ne 0 -or ($messages -join "`n") -cnotmatch '(?m)^Nessun testo trovato nel PDF\.\r?$' -or
+              !(Test-Path -LiteralPath $output -PathType Leaf) -or (Get-Item -LiteralPath $output).Length -ne 0) {
+              throw "Expected an empty Markdown file and a successful conversion: $messages"
+          }
+
+      - name: 'Prova: scansione senza rete'
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $exe = Join-Path $env:PDF2MD_EXTRACTED 'bin\pdf2md.exe'
+          $curl = Join-Path $env:SystemRoot 'System32\curl.exe'
+          $curlArgs = '--fail', '--silent', '--head', '--noproxy', '*', '--connect-timeout', '5', '--max-time', '12',
+              '--output', 'NUL', 'https://pypi.org/pypi/onnxruntime/1.27.0/json'
+          $env:PDF_INSPECTOR_MODEL_CACHE = Join-Path $env:PDF2MD_TEST_DIR 'empty-model-cache'
+          $null = New-Item -ItemType Directory -Path $env:PDF_INSPECTOR_MODEL_CACHE
+          $pdf = Join-Path $env:PDF2MD_TEST_DIR 'scansione.pdf'
+          Copy-Item tests/fixtures/scan_with_native_header_text.pdf -Destination $pdf
+          $active = @(Get-NetConnectionProfile | ForEach-Object {
+              if ($_.NetworkCategory -eq 'DomainAuthenticated') { 'Domain' } else { [string]$_.NetworkCategory }
+          } | Sort-Object -Unique)
+          if ($active.Count -eq 0) { throw 'No active network profiles' }
+          $original = Get-NetFirewallProfile -Name $active -PolicyStore PersistentStore
+          $rules = @()
+          try {
+              Set-NetFirewallProfile -Name $active -PolicyStore PersistentStore -Enabled True
+              $enabled = @(Get-NetFirewallProfile -Name $active -PolicyStore ActiveStore | Where-Object Enabled -eq 'True')
+              if ($enabled.Count -ne $active.Count) { throw 'An active firewall profile is disabled' }
+              & $curl @curlArgs
+              if ($LASTEXITCODE -ne 0) { throw 'The network control must be reachable before adding firewall rules' }
+              foreach ($program in $exe, $curl) {
+                  $rules += New-NetFirewallRule -DisplayName 'pdf2md offline smoke' -Program $program -Direction Outbound -Action Block
+              }
+              & $curl @curlArgs
+              if ($LASTEXITCODE -notin 7, 28) { throw "Expected the firewall to block curl, got exit $LASTEXITCODE" }
+              & "$env:PDF2MD_EXTRACTED/pdf2md.cmd" $pdf
+              if ($LASTEXITCODE -ne 0) { throw 'Offline conversion failed' }
+              $output = [IO.Path]::ChangeExtension($pdf, '.md')
+              $env:PDFIUM_LIB_PATH = Join-Path $env:PDF2MD_EXTRACTED 'bin\pdfium.dll'
+              $env:ORT_DYLIB_PATH = Join-Path $env:PDF2MD_EXTRACTED 'bin\onnxruntime.dll'
+              $models = Join-Path $env:PDF2MD_EXTRACTED 'models\pp-ocrv6-small'
+              $expected = Join-Path $env:PDF2MD_TEST_DIR 'scansione-expected.md'
+              & $exe --ocr auto --ocr-offline --ocr-model-dir $models $pdf $expected 2>$null
+              if ($LASTEXITCODE -ne 0 -or (Get-FileHash $output).Hash -ne (Get-FileHash $expected).Hash) {
+                  throw 'Raw Markdown differs from the OCR reference'
+              }
+              $markdown = [Text.UTF8Encoding]::new($false, $true).GetString([IO.File]::ReadAllBytes($output))
+              # The PDF's native text contains only the report title.
+              if ($markdown -notmatch 'Order Date Item Code Description Status Unit Cost' -or
+                  $markdown -notmatch '482,110\.40' -or @(Get-ChildItem -LiteralPath $env:PDF_INSPECTOR_MODEL_CACHE -Force).Count -ne 0) {
+                  throw 'Expected the scanned body text and an untouched model cache'
+              }
+          } finally {
+              try {
+                  foreach ($rule in $rules) { Remove-NetFirewallRule -Name $rule.Name }
+              } finally {
+                  foreach ($profile in $original) {
+                      Set-NetFirewallProfile -Name $profile.Name -PolicyStore PersistentStore -Enabled $profile.Enabled
+                  }
+              }
+          }
+
+      - name: 'Prova: cifre nella fascia alta'
+        run: |
+          $testSource = Get-Content tests/integration_tests.rs -Raw
+          $fixture = [regex]::Match($testSource, '(?ms)^fn make_a4_margin_body_digits_pdf\(\) -> Vec<u8> \{.*?^\}')
+          if (!$fixture.Success) { throw 'A4 regression fixture not found' }
+          $source = Join-Path $env:PDF2MD_TEST_DIR 'make_a4.rs'
+          $builder = Join-Path $env:PDF2MD_TEST_DIR 'make_a4.exe'
+          $pdf = Join-Path $env:PDF2MD_TEST_DIR 'a4.pdf'
+          $main = 'fn main() { std::fs::write(std::env::args_os().nth(1).unwrap(), make_a4_margin_body_digits_pdf()).unwrap(); }'
+          Set-Content -LiteralPath $source -Value $fixture.Value, $main -Encoding utf8
+          rustc --edition 2021 $source -o $builder
+          if ($LASTEXITCODE -ne 0) { throw 'A4 fixture builder did not compile' }
+          & $builder $pdf
+          if ($LASTEXITCODE -ne 0) { throw 'A4 fixture generation failed' }
+          & "$env:PDF2MD_EXTRACTED/pdf2md.cmd" $pdf
+          if ($LASTEXITCODE -ne 0) { throw 'A4 conversion failed' }
+          $markdown = Get-Content -LiteralPath ([IO.Path]::ChangeExtension($pdf, '.md')) -Raw
+          $tokens = $markdown -split '[^a-zA-Z0-9.]+'
+          foreach ($number in '21', '22', '23', '91', '92', '93') {
+              if ($number -notin $tokens) { throw "A4 body number $number was lost" }
+          }
+          foreach ($folio in '1', '2', '3') {
+              if ($folio -in $tokens) { throw "A4 folio $folio survived" }
+          }
+
+      - name: 'Prova: PATH idempotente'
+        run: |
+          $systemPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          $initialKey = Get-Item HKCU:\Environment
+          $expectedKind = if ($initialKey.GetValueNames() -contains 'Path') { $initialKey.GetValueKind('Path') } else { 'ExpandString' }
+          $installer = Join-Path $env:PDF2MD_EXTRACTED 'aggiungi-al-path.cmd'
+          foreach ($run in 1, 2) {
+              & $installer
+              if ($LASTEXITCODE -ne 0) { throw "PATH update $run failed" }
+          }
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $entries = @($userPath -split ';' | Where-Object { $_.TrimEnd('\') -eq $env:PDF2MD_EXTRACTED })
+          $updatedKey = Get-Item HKCU:\Environment
+          if ($entries.Count -ne 1 -or $updatedKey.GetValueKind('Path') -ne $expectedKind -or
+              [Environment]::GetEnvironmentVariable('Path', 'Machine') -cne $systemPath) {
+              throw 'Expected one bundle entry and an unchanged system PATH'
+          }
+
+      - name: 'Prova: guardia della modalità limitata nel corpo PowerShell'
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $installer = Join-Path $env:PDF2MD_EXTRACTED 'aggiungi-al-path.cmd'
+          $env:PDF2MD_BUNDLE_DIR = $env:PDF2MD_EXTRACTED
+          $body = Get-Content -LiteralPath $installer | ForEach-Object {
+              if ($_ -match '^\s+"(.*)"\s*\^?$') { $Matches[1] }
+          }
+          $script = "`$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'`n" + ($body -join "`n")
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script))
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          $messages = & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -NonInteractive -EncodedCommand $encoded
+          if ($LASTEXITCODE -ne 2 -or ($messages -join "`n") -cnotmatch 'Il PATH utente resta invariato\.' -or
+              [Environment]::GetEnvironmentVariable('Path', 'User') -cne $userPath) {
+              throw "Expected an explicit PATH result in Constrained Language Mode: $messages"
+          }
+          $global:LASTEXITCODE = 0
+
+      - name: 'Prova: pausa senza PowerShell'
+        timeout-minutes: 2
+        run: |
+          $helper = Join-Path $env:PDF2MD_EXTRACTED 'bin\pausa-se-da-esplora.cmd'
+          $cmd = $env:ComSpec
+          $systemRoot = $env:SystemRoot
+          try {
+              $env:SystemRoot = Join-Path $env:PDF2MD_TEST_DIR 'missing-system-root'
+              $messages = 'x' | & $cmd /d /c call $helper
+              if ($LASTEXITCODE -ne 0 -or ($messages -join "`n") -cnotmatch 'Premi un tasto per chiudere\.') {
+                  throw "Expected the native pause to run when PowerShell could not start: $messages"
+              }
+          } finally {
+              $env:SystemRoot = $systemRoot
+          }
+
+      - name: 'Prova: comando dal PATH'
+        run: |
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+              [Environment]::GetEnvironmentVariable('Path', 'User')
+          $bundleLauncher = Join-Path $env:PDF2MD_EXTRACTED 'pdf2md.cmd'
+          if ((Get-Command pdf2md -ErrorAction Stop).Source -ne $bundleLauncher) {
+              throw 'PATH did not resolve pdf2md.cmd'
+          }
+          $pdf = Join-Path $env:PDF2MD_TEST_DIR 'dal-path.pdf'
+          Copy-Item tests/fixtures/thermo-freon12.pdf -Destination $pdf
+          Set-Location $env:PDF2MD_TEST_DIR
+          & cmd.exe /d /c 'pdf2md dal-path.pdf'
+          if ($LASTEXITCODE -ne 0 -or (Get-Content -LiteralPath 'dal-path.md' -Raw) -notmatch 'Freon') {
+              throw 'The PATH command failed to write Markdown'
+          }
+
+      - name: Upload the ZIP and SHA-256
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: pdf2md-windows
+          path: ${{ env.PDF2MD_PACKAGE }}
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/pdf2md-windows-')
+    needs: bundle
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: pdf2md-windows
+          path: package
+
+      - name: Publish the tested ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "package/$env:GITHUB_REF_NAME.zip"
+          gh release create $env:GITHUB_REF_NAME $zip "$zip.sha256" --repo $env:GITHUB_REPOSITORY --verify-tag --title $env:GITHUB_REF_NAME --notes 'Windows x64. Extract the archive and open LEGGIMI.txt.'
